@@ -1,0 +1,10 @@
+---
+description: Обновлять docs/workflow-json.md при изменении формата workflow
+alwaysApply: true
+---
+
+# Описание workflow для ChatGPT
+
+Файл `docs/workflow-json.md` — инструкция, по которой модель собирает JSON workflow. Примеры в нём проверяет `tests/workflow-json.test.ts`.
+
+Если меняешь типы шагов или входов, поля `config`, правила графа, переменные `{{...}}`, смысл `id` / `key` или проверку JSON, в том же изменении обнови `docs/workflow-json.md`: поля, допустимые значения и затронутый пример. Не оставляй в описании поведение, которого в коде уже нет.
