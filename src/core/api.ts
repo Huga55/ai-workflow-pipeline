@@ -41,13 +41,20 @@ export type PipelineApi = {
   getRun: (runId: string) => Promise<RunDetails>
   updateRunInputs: (runId: string, inputs: Record<string, unknown>) => Promise<RunDetails>
   updateRunTitle: (runId: string, title: string) => Promise<RunDetails>
+  setRunVersion: (runId: string, versionNumber: number) => Promise<RunDetails>
   startRun: (runId: string, options?: { untilStepId?: string }) => Promise<RunDetails>
   continueRun: (
     runId: string,
-    options?: { branchId?: string; untilStepId?: string; startManualBranches?: boolean }
+    options?: { branchId?: string; untilStepId?: string; startManualBranches?: boolean; note?: string }
   ) => Promise<RunDetails>
   retryStep: (runId: string, stepId: string, branchId: string) => Promise<RunDetails>
-  runStep: (runId: string, stepId: string, branchId: string, mode: 'only' | 'chain') => Promise<RunDetails>
+  runStep: (
+    runId: string,
+    stepId: string,
+    branchId: string,
+    mode: 'only' | 'chain',
+    options?: { appendBatch?: boolean }
+  ) => Promise<RunDetails>
   skipStep: (runId: string, stepId: string, branchId: string) => Promise<RunDetails>
   listVariables: (scope: 'global' | 'project', projectId?: string) => Promise<NamedVariable[]>
   saveVariable: (input: {
@@ -56,7 +63,12 @@ export type PipelineApi = {
     name: string
     label: string
     value: unknown
+    description?: string
   }) => Promise<NamedVariable>
+  updateVariable: (input: { id: string; name: string; label: string }) => Promise<NamedVariable>
+  addVariableVersion: (input: { id: string; value: unknown; description?: string }) => Promise<NamedVariable>
+  updateVariableVersion: (input: { id: string; description: string }) => Promise<NamedVariable>
+  deleteVariableVersion: (id: string) => Promise<NamedVariable>
   deleteVariable: (id: string) => Promise<void>
   submitUserAction: (runId: string, executionId: string, payload: UserActionPayload) => Promise<RunDetails>
   cancelRun: (runId: string) => Promise<RunDetails>

@@ -22,7 +22,7 @@ export type InputType =
   | 'select'
   | 'multi-select'
 
-export type StepType = 'input' | 'ai' | 'transform' | 'parse' | 'manual' | 'merge'
+export type StepType = 'input' | 'ai' | 'transform' | 'parse' | 'fanout' | 'manual' | 'merge'
 
 export type ExecutionStatus =
   | 'pending'
@@ -73,6 +73,7 @@ export type IterateConfig = {
   over: string
   alias: string
   launch: 'all' | 'manual'
+  noteAlias?: string
 }
 
 export type AIStepConfig = {
@@ -136,6 +137,8 @@ export type InputStepConfig = {
   keys: string[]
 }
 
+export type FanoutStepConfig = Record<string, never>
+
 export type StepConfig =
   | AIStepConfig
   | TransformStepConfig
@@ -143,6 +146,7 @@ export type StepConfig =
   | ManualStepConfig
   | MergeStepConfig
   | InputStepConfig
+  | FanoutStepConfig
 
 type StepBase = {
   id: string
@@ -163,6 +167,7 @@ export type StepDefinition = StepBase &
     | { type: 'manual'; config: ManualStepConfig }
     | { type: 'merge'; config: MergeStepConfig }
     | { type: 'input'; config: InputStepConfig }
+    | { type: 'fanout'; config: FanoutStepConfig }
   )
 
 export type WorkflowGraph = {
@@ -243,9 +248,12 @@ export type Branch = {
   parentBranchId: string
   sourceStepId: string
   itemIndex: number
+  batch: number
   alias: string
   label: string
   item: unknown
+  note: string
+  noteAlias: string
   status: BranchStatus
 }
 
@@ -268,6 +276,7 @@ export type ManualWaiting = {
 export type ExecutionMeta = {
   fanoutError?: boolean
   fanoutResolved?: boolean
+  interrupted?: boolean
   waiting?: ManualWaiting
   providerResponse?: unknown
   usage?: unknown
@@ -381,14 +390,23 @@ export type ProviderStatus = {
 
 export type AdvanceResult = 'completed' | 'paused' | 'failed' | 'cancelled'
 
+export type VariableVersion = {
+  id: string
+  version: number
+  description: string
+  value: unknown
+  createdAt: string
+}
+
 export type NamedVariable = {
   id: string
   scope: 'global' | 'project'
   projectId: string | null
   name: string
   label: string
-  value: unknown
+  createdAt: string
   updatedAt: string
+  versions: VariableVersion[]
 }
 
 export type VariableContext = {
@@ -399,4 +417,5 @@ export type VariableContext = {
   aliases: Record<string, unknown>
   globals?: Record<string, unknown>
   project?: Record<string, unknown>
+  prev?: { output: unknown }
 }

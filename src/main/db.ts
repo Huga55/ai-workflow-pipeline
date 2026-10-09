@@ -80,9 +80,12 @@ CREATE TABLE IF NOT EXISTS branches (
   parent_branch_id TEXT NOT NULL DEFAULT '',
   source_step_id TEXT NOT NULL,
   item_index INTEGER NOT NULL,
+  batch INTEGER NOT NULL DEFAULT 0,
   alias TEXT NOT NULL,
   label TEXT NOT NULL,
   item_json TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  note_alias TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
   UNIQUE(run_id, parent_branch_id, source_step_id, item_index)
 );
@@ -122,9 +125,19 @@ CREATE TABLE IF NOT EXISTS named_variables (
   project_id TEXT NOT NULL DEFAULT '',
   name TEXT NOT NULL,
   label TEXT NOT NULL DEFAULT '',
-  value_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(scope, project_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS named_variable_versions (
+  id TEXT PRIMARY KEY,
+  variable_id TEXT NOT NULL REFERENCES named_variables(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  value_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(variable_id, version)
 );
 
 CREATE TABLE IF NOT EXISTS user_actions (
@@ -143,7 +156,11 @@ export class AppDatabase {
   static open(filePath: string): AppDatabase {
     mkdirSync(path.dirname(filePath), { recursive: true })
     const db = new DatabaseSync(filePath)
+    migrateNamedVariables(db)
     db.exec(SCHEMA)
+    ensureColumn(db, 'branches', 'note', `TEXT NOT NULL DEFAULT ''`)
+    ensureColumn(db, 'branches', 'note_alias', `TEXT NOT NULL DEFAULT ''`)
+    ensureColumn(db, 'branches', 'batch', `INTEGER NOT NULL DEFAULT 0`)
     return new AppDatabase(db)
   }
 
@@ -404,6 +421,16 @@ export class AppDatabase {
     this.run(`UPDATE runs SET title = ?, updated_at = ? WHERE id = ?`, title, updatedAt, runId)
   }
 
+  updateRunWorkflowVersion(runId: string, versionId: string, inputs: Record<string, unknown>, updatedAt: string): void {
+    this.run(
+      `UPDATE runs SET workflow_version_id = ?, inputs_json = ?, updated_at = ? WHERE id = ?`,
+      versionId,
+      JSON.stringify(inputs),
+      updatedAt,
+      runId
+    )
+  }
+
   updateRunStatus(runId: string, status: RunStatus, error: string | null, updatedAt: string): void {
     this.run(`UPDATE runs SET status = ?, error = ?, updated_at = ? WHERE id = ?`, status, error, updatedAt, runId)
   }
@@ -462,81 +489,167 @@ export class AppDatabase {
     )
   }
 
+  confirmRejectedBranchIds(runId: string): Set<string> {
+    const rows = this.all<{ branchId: string; payloadJson: string }>(
+      `SELECT e.branch_id AS branchId, a.payload_json AS payloadJson
+       FROM user_actions a
+       JOIN step_executions e ON e.id = a.step_execution_id
+       WHERE a.run_id = ? AND a.action_type = 'confirm'`,
+      runId
+    )
+    const ids = new Set<string>()
+    for (const row of rows) {
+      try {
+        const payload = JSON.parse(row.payloadJson) as { accepted?: boolean }
+        if (payload.accepted === false && row.branchId) ids.add(row.branchId)
+      } catch {
+        continue
+      }
+    }
+    return ids
+  }
+
   listBranches(runId: string): Branch[] {
     return this.all<BranchRow>(
       `SELECT id, run_id AS runId, parent_branch_id AS parentBranchId, source_step_id AS sourceStepId,
-              item_index AS itemIndex, alias, label, item_json AS itemJson, status
+              item_index AS itemIndex, batch, alias, label, item_json AS itemJson, note, note_alias AS noteAlias, status
        FROM branches WHERE run_id = ? ORDER BY item_index ASC`,
       runId
-    ).map((row) => ({
-      id: row.id,
-      runId: row.runId,
-      parentBranchId: row.parentBranchId,
-      sourceStepId: row.sourceStepId,
-      itemIndex: row.itemIndex,
-      alias: row.alias,
-      label: row.label,
-      item: JSON.parse(row.itemJson) as unknown,
-      status: row.status as Branch['status']
-    }))
+    ).map(mapBranch)
   }
 
   insertBranch(branch: Branch): void {
     this.run(
-      `INSERT INTO branches (id, run_id, parent_branch_id, source_step_id, item_index, alias, label, item_json, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO branches (id, run_id, parent_branch_id, source_step_id, item_index, batch, alias, label, item_json, note, note_alias, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       branch.id,
       branch.runId,
       branch.parentBranchId,
       branch.sourceStepId,
       branch.itemIndex,
+      branch.batch ?? 0,
       branch.alias,
       branch.label,
       JSON.stringify(branch.item),
+      branch.note ?? '',
+      branch.noteAlias ?? '',
       branch.status
     )
   }
 
   updateBranch(branch: Branch): void {
     this.run(
-      `UPDATE branches SET status = ?, label = ?, alias = ?, item_json = ? WHERE id = ?`,
+      `UPDATE branches SET status = ?, label = ?, alias = ?, item_json = ?, note = ?, note_alias = ? WHERE id = ?`,
       branch.status,
       branch.label,
       branch.alias,
       JSON.stringify(branch.item),
+      branch.note ?? '',
+      branch.noteAlias ?? '',
       branch.id
     )
   }
 
   listVariables(scope: 'global' | 'project', projectId: string | null): NamedVariable[] {
-    return this.all<VariableRow>(
-      `SELECT id, scope, project_id AS projectId, name, label, value_json AS valueJson, updated_at AS updatedAt
-       FROM named_variables WHERE scope = ? AND project_id = ? ORDER BY name`,
-      scope,
-      projectId ?? ''
-    ).map(mapVariable)
+    return groupVariables(
+      this.all<JoinedVariableRow>(
+        `${VARIABLE_SELECT} WHERE nv.scope = ? AND nv.project_id = ? ORDER BY nv.name, nvv.version`,
+        scope,
+        projectId ?? ''
+      )
+    )
   }
 
-  saveVariable(variable: NamedVariable): void {
+  getVariable(id: string): NamedVariable {
+    const [variable] = groupVariables(this.all<JoinedVariableRow>(`${VARIABLE_SELECT} WHERE nv.id = ? ORDER BY nvv.version`, id))
+    if (!variable) throw new Error('Переменная не найдена')
+    return variable
+  }
+
+  insertVariable(variable: NamedVariable): void {
+    this.db.exec('BEGIN')
+    try {
+      this.run(
+        `INSERT INTO named_variables (id, scope, project_id, name, label, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        variable.id,
+        variable.scope,
+        variable.projectId ?? '',
+        variable.name,
+        variable.label,
+        variable.createdAt,
+        variable.updatedAt
+      )
+      for (const version of variable.versions) this.insertVersionRow(variable.id, version)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  updateVariable(id: string, patch: { name: string; label: string }, updatedAt: string): void {
     this.run(
-      `INSERT INTO named_variables (id, scope, project_id, name, label, value_json, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(scope, project_id, name) DO UPDATE SET
-         label = excluded.label,
-         value_json = excluded.value_json,
-         updated_at = excluded.updated_at`,
-      variable.id,
-      variable.scope,
-      variable.projectId ?? '',
-      variable.name,
-      variable.label,
-      JSON.stringify(variable.value),
-      variable.updatedAt
+      `UPDATE named_variables SET name = ?, label = ?, updated_at = ? WHERE id = ?`,
+      patch.name,
+      patch.label,
+      updatedAt,
+      id
     )
+  }
+
+  insertVariableVersion(variableId: string, version: NamedVariable['versions'][number], updatedAt: string): void {
+    this.db.exec('BEGIN')
+    try {
+      this.insertVersionRow(variableId, version)
+      this.run(`UPDATE named_variables SET updated_at = ? WHERE id = ?`, updatedAt, variableId)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  updateVersionDescription(versionId: string, description: string, updatedAt: string): void {
+    const row = this.get<{ variableId: string }>(
+      `SELECT variable_id AS variableId FROM named_variable_versions WHERE id = ?`,
+      versionId
+    )
+    if (!row) throw new Error('Версия не найдена')
+    this.run(`UPDATE named_variable_versions SET description = ? WHERE id = ?`, description, versionId)
+    this.run(`UPDATE named_variables SET updated_at = ? WHERE id = ?`, updatedAt, row.variableId)
+  }
+
+  deleteVariableVersion(versionId: string, updatedAt: string): void {
+    const row = this.get<{ variableId: string }>(
+      `SELECT variable_id AS variableId FROM named_variable_versions WHERE id = ?`,
+      versionId
+    )
+    if (!row) throw new Error('Версия не найдена')
+    const count = this.get<{ total: number }>(
+      `SELECT COUNT(*) AS total FROM named_variable_versions WHERE variable_id = ?`,
+      row.variableId
+    )
+    if ((count?.total ?? 0) <= 1) throw new Error('Нельзя удалить единственную версию')
+    this.run(`DELETE FROM named_variable_versions WHERE id = ?`, versionId)
+    this.run(`UPDATE named_variables SET updated_at = ? WHERE id = ?`, updatedAt, row.variableId)
   }
 
   deleteVariable(id: string): void {
     this.run(`DELETE FROM named_variables WHERE id = ?`, id)
+  }
+
+  private insertVersionRow(variableId: string, version: NamedVariable['versions'][number]): void {
+    this.run(
+      `INSERT INTO named_variable_versions (id, variable_id, version, description, value_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      version.id,
+      variableId,
+      version.version,
+      version.description,
+      JSON.stringify(version.value),
+      version.createdAt
+    )
   }
 
   listArtifacts(runId: string): Artifact[] {
@@ -657,9 +770,7 @@ export class AppDatabase {
       payload: JSON.parse(row.payloadJson) as unknown,
       createdAt: row.createdAt
     }))
-    const variables = this.all<VariableRow>(
-      `SELECT id, scope, project_id AS projectId, name, label, value_json AS valueJson, updated_at AS updatedAt FROM named_variables`
-    ).map(mapVariable)
+    const variables = groupVariables(this.all<JoinedVariableRow>(`${VARIABLE_SELECT} ORDER BY nv.name, nvv.version`))
     return { projects, workflows, versions, drafts, runs, branches, executions, artifacts, actions, variables }
   }
 
@@ -773,25 +884,31 @@ export class AppDatabase {
           branch.id
         )
         this.run(
-          `INSERT INTO branches (id, run_id, parent_branch_id, source_step_id, item_index, alias, label, item_json, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO branches (id, run_id, parent_branch_id, source_step_id, item_index, batch, alias, label, item_json, note, note_alias, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              run_id = excluded.run_id,
              parent_branch_id = excluded.parent_branch_id,
              source_step_id = excluded.source_step_id,
              item_index = excluded.item_index,
+             batch = excluded.batch,
              alias = excluded.alias,
              label = excluded.label,
              item_json = excluded.item_json,
+             note = excluded.note,
+             note_alias = excluded.note_alias,
              status = excluded.status`,
           branch.id,
           branch.runId,
           branch.parentBranchId,
           branch.sourceStepId,
           branch.itemIndex,
+          branch.batch ?? 0,
           branch.alias,
           branch.label,
           JSON.stringify(branch.item),
+          branch.note ?? '',
+          branch.noteAlias ?? '',
           branch.status
         )
       }
@@ -891,23 +1008,47 @@ export class AppDatabase {
           variable.id
         )
         this.run(
-          `INSERT INTO named_variables (id, scope, project_id, name, label, value_json, updated_at)
+          `INSERT INTO named_variables (id, scope, project_id, name, label, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              scope = excluded.scope,
              project_id = excluded.project_id,
              name = excluded.name,
              label = excluded.label,
-             value_json = excluded.value_json,
+             created_at = excluded.created_at,
              updated_at = excluded.updated_at`,
           variable.id,
           variable.scope,
           projectId,
           variable.name,
           variable.label,
-          JSON.stringify(variable.value),
+          variable.createdAt,
           variable.updatedAt
         )
+        for (const version of variable.versions) {
+          this.run(
+            `DELETE FROM named_variable_versions WHERE variable_id = ? AND version = ? AND id <> ?`,
+            variable.id,
+            version.version,
+            version.id
+          )
+          this.run(
+            `INSERT INTO named_variable_versions (id, variable_id, version, description, value_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               variable_id = excluded.variable_id,
+               version = excluded.version,
+               description = excluded.description,
+               value_json = excluded.value_json,
+               created_at = excluded.created_at`,
+            version.id,
+            variable.id,
+            version.version,
+            version.description,
+            JSON.stringify(version.value),
+            version.createdAt
+          )
+        }
       }
       this.db.exec('COMMIT')
     } catch (error) {
@@ -919,19 +1060,9 @@ export class AppDatabase {
   private listAllBranches(): Branch[] {
     return this.all<BranchRow>(
       `SELECT id, run_id AS runId, parent_branch_id AS parentBranchId, source_step_id AS sourceStepId,
-              item_index AS itemIndex, alias, label, item_json AS itemJson, status
+              item_index AS itemIndex, batch, alias, label, item_json AS itemJson, note, note_alias AS noteAlias, status
        FROM branches`
-    ).map((row) => ({
-      id: row.id,
-      runId: row.runId,
-      parentBranchId: row.parentBranchId,
-      sourceStepId: row.sourceStepId,
-      itemIndex: row.itemIndex,
-      alias: row.alias,
-      label: row.label,
-      item: JSON.parse(row.itemJson) as unknown,
-      status: row.status as Branch['status']
-    }))
+    ).map(mapBranch)
   }
 
   private all<T>(sql: string, ...params: SQLInput[]): T[] {
@@ -1042,21 +1173,60 @@ type BranchRow = {
   parentBranchId: string
   sourceStepId: string
   itemIndex: number
+  batch: number | null
   alias: string
   label: string
   itemJson: string
+  note: string | null
+  noteAlias: string | null
   status: string
 }
 
-type VariableRow = {
+function mapBranch(row: BranchRow): Branch {
+  return {
+    id: row.id,
+    runId: row.runId,
+    parentBranchId: row.parentBranchId,
+    sourceStepId: row.sourceStepId,
+    itemIndex: row.itemIndex,
+    batch: row.batch ?? 0,
+    alias: row.alias,
+    label: row.label,
+    item: JSON.parse(row.itemJson) as unknown,
+    note: row.note ?? '',
+    noteAlias: row.noteAlias ?? '',
+    status: row.status as Branch['status']
+  }
+}
+
+function ensureColumn(db: DatabaseSync, table: string, column: string, definition: string): void {
+  const exists = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`).get(table)
+  if (!exists) return
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+  if (columns.some((item) => item.name === column)) return
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+}
+
+type JoinedVariableRow = {
   id: string
   scope: string
   projectId: string
   name: string
   label: string
-  valueJson: string
+  createdAt: string
   updatedAt: string
+  versionId: string | null
+  version: number | null
+  description: string | null
+  valueJson: string | null
+  versionCreatedAt: string | null
 }
+
+const VARIABLE_SELECT = `SELECT nv.id, nv.scope, nv.project_id AS projectId, nv.name, nv.label,
+  nv.created_at AS createdAt, nv.updated_at AS updatedAt,
+  nvv.id AS versionId, nvv.version, nvv.description, nvv.value_json AS valueJson, nvv.created_at AS versionCreatedAt
+  FROM named_variables nv
+  LEFT JOIN named_variable_versions nvv ON nvv.variable_id = nv.id`
 
 type ArtifactRow = {
   id: string
@@ -1068,15 +1238,74 @@ type ArtifactRow = {
   createdAt: string
 }
 
-function mapVariable(row: VariableRow): NamedVariable {
-  return {
-    id: row.id,
-    scope: row.scope === 'project' ? 'project' : 'global',
-    projectId: row.projectId || null,
-    name: row.name,
-    label: row.label,
-    value: JSON.parse(row.valueJson) as unknown,
-    updatedAt: row.updatedAt
+function groupVariables(rows: JoinedVariableRow[]): NamedVariable[] {
+  const grouped = new Map<string, NamedVariable>()
+  for (const row of rows) {
+    let variable = grouped.get(row.id)
+    if (!variable) {
+      variable = {
+        id: row.id,
+        scope: row.scope === 'project' ? 'project' : 'global',
+        projectId: row.projectId || null,
+        name: row.name,
+        label: row.label,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+        versions: []
+      }
+      grouped.set(row.id, variable)
+    }
+    if (row.versionId && row.version != null && row.valueJson != null && row.versionCreatedAt) {
+      variable.versions.push({
+        id: row.versionId,
+        version: row.version,
+        description: row.description ?? '',
+        value: JSON.parse(row.valueJson) as unknown,
+        createdAt: row.versionCreatedAt
+      })
+    }
+  }
+  return [...grouped.values()]
+}
+
+function migrateNamedVariables(db: DatabaseSync): void {
+  const table = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'named_variables'`).get()
+  if (!table) return
+  const columns = db.prepare(`PRAGMA table_info(named_variables)`).all() as Array<{ name: string }>
+  if (!columns.some((column) => column.name === 'value_json')) return
+  try {
+    db.exec(`
+      BEGIN;
+      ALTER TABLE named_variables RENAME TO named_variables_legacy;
+      CREATE TABLE named_variables (
+        id TEXT PRIMARY KEY,
+        scope TEXT NOT NULL,
+        project_id TEXT NOT NULL DEFAULT '',
+        name TEXT NOT NULL,
+        label TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(scope, project_id, name)
+      );
+      CREATE TABLE named_variable_versions (
+        id TEXT PRIMARY KEY,
+        variable_id TEXT NOT NULL REFERENCES named_variables(id) ON DELETE CASCADE,
+        version INTEGER NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        value_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(variable_id, version)
+      );
+      INSERT INTO named_variables (id, scope, project_id, name, label, created_at, updated_at)
+      SELECT id, scope, project_id, name, label, updated_at, updated_at FROM named_variables_legacy;
+      INSERT INTO named_variable_versions (id, variable_id, version, description, value_json, created_at)
+      SELECT id || '-v1', id, 1, '', value_json, updated_at FROM named_variables_legacy;
+      DROP TABLE named_variables_legacy;
+      COMMIT;
+    `)
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
   }
 }
 

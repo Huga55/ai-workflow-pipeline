@@ -1,13 +1,14 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { createId } from '@core/ids'
 import { createInput, createStep } from '@core/factories'
 import { topoSort, validateGraph } from '@core/graph'
 import { INPUT_TYPE_LABEL, STEP_TYPE_HINT, STEP_TYPE_LABEL, slugify, uniqueKey } from '@core/labels'
-import type { VariablePools } from '@core/variables'
+import { latestVariableVersion, type VariablePools } from '@core/variables'
 import type { AIMessageDraft, InputDefinition, InputType, StepDefinition, StepType, WorkflowDetails, WorkflowGraph } from '@core/types'
-import { errorText, Hint, TemplateField, VariablePoolsContext } from '../ui'
+import { formatWorkflowJson, parseWorkflowJson, type WorkflowJsonDocument } from '@core/workflow-json'
+import { copyText, errorText, Hint, TemplateField, VariablePoolsContext } from '../ui'
 
-const STEP_TYPES: StepType[] = ['ai', 'transform', 'parse', 'manual', 'merge', 'input']
+const STEP_TYPES: StepType[] = ['ai', 'transform', 'parse', 'fanout', 'manual', 'merge', 'input']
 const INPUT_TYPES = Object.keys(INPUT_TYPE_LABEL) as InputType[]
 
 export function WorkflowPage({
@@ -37,20 +38,37 @@ export function WorkflowPage({
   const [error, setError] = useState<string | null>(null)
   const snapshot = useRef({ name: '', description: '', graph, selectedId, dirty: false })
   const [pools, setPools] = useState<VariablePools>({})
+  const [view, setView] = useState<'builder' | 'json'>('builder')
+  const [jsonText, setJsonText] = useState('')
+  const [jsonError, setJsonError] = useState<string | null>(null)
+  const jsonEdited = useRef(false)
+  const jsonTextRef = useRef(jsonText)
+  jsonTextRef.current = jsonText
   const readOnly = Boolean(version && details && version !== details.workflow.latestVersion)
+  const structureLocked = readOnly || view === 'json'
 
   useEffect(() => {
     void Promise.all([window.pipeline.listVariables('global'), window.pipeline.listVariables('project', projectId)])
       .then(([globals, project]) =>
         setPools({
-          globals: globals.map((item) => ({ name: item.name, label: item.label || item.name })),
-          project: project.map((item) => ({ name: item.name, label: item.label || item.name }))
+          globals: globals.map((item) => ({
+            name: item.name,
+            label: item.label || item.name,
+            version: latestVariableVersion(item)?.version
+          })),
+          project: project.map((item) => ({
+            name: item.name,
+            label: item.label || item.name,
+            version: latestVariableVersion(item)?.version
+          }))
         })
       )
       .catch(() => undefined)
   }, [projectId])
 
   useEffect(() => {
+    jsonEdited.current = false
+    setJsonError(null)
     let cancelled = false
     void Promise.all([
       window.pipeline.getWorkflow(workflowId, version),
@@ -63,6 +81,7 @@ export function WorkflowPage({
           setName(draft.name)
           setDescription(draft.description)
           setGraph(draft.graph)
+          setJsonText(formatWorkflowJson({ name: draft.name, description: draft.description, graph: draft.graph }))
           setSelectedId(draft.selectedId ?? draft.graph.steps[0]?.id ?? null)
           setDirty(true)
           setRestored(true)
@@ -71,6 +90,7 @@ export function WorkflowPage({
         setName(next.workflow.name)
         setDescription(next.workflow.description)
         setGraph(next.version.graph)
+        setJsonText(formatWorkflowJson({ name: next.workflow.name, description: next.workflow.description, graph: next.version.graph }))
         setSelectedId(next.version.graph.steps[0]?.id ?? null)
         setDirty(false)
         setRestored(false)
@@ -86,6 +106,11 @@ export function WorkflowPage({
   useEffect(() => {
     snapshot.current = { name, description, graph, selectedId, dirty }
   })
+
+  useEffect(() => {
+    if (jsonEdited.current) return
+    setJsonText(formatWorkflowJson({ name, description, graph }))
+  }, [name, description, graph])
 
   useEffect(() => {
     if (!dirty || readOnly) return
@@ -106,18 +131,33 @@ export function WorkflowPage({
 
   useEffect(() => {
     const flush = () => {
+      if (readOnly || typeof window.pipeline.saveDraftNow !== 'function') return
       const current = snapshot.current
-      if (!current.dirty || readOnly || typeof window.pipeline.saveDraftNow !== 'function') return
-      window.pipeline.saveDraftNow(workflowId, {
+      let draft = {
         name: current.name,
         description: current.description,
         graph: current.graph,
         selectedId: current.selectedId
-      })
+      }
+      if (jsonEdited.current) {
+        const parsed = parseWorkflowJson(jsonTextRef.current, { previous: current.graph })
+        if (parsed.ok) {
+          draft = {
+            name: parsed.document.name,
+            description: parsed.document.description,
+            graph: parsed.document.graph,
+            selectedId: current.selectedId
+          }
+        } else if (!current.dirty) return
+      } else if (!current.dirty) return
+      window.pipeline.saveDraftNow(workflowId, draft)
     }
     window.addEventListener('beforeunload', flush)
-    return () => window.removeEventListener('beforeunload', flush)
-  }, [readOnly, workflowId])
+    return () => {
+      window.removeEventListener('beforeunload', flush)
+      flush()
+    }
+  }, [readOnly, workflowId, version])
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -130,12 +170,70 @@ export function WorkflowPage({
     return () => window.removeEventListener('keydown', onKey)
   })
 
+  function applyDocument(document: WorkflowJsonDocument) {
+    jsonEdited.current = false
+    setName(document.name)
+    setDescription(document.description)
+    setGraph(document.graph)
+    setJsonText(formatWorkflowJson(document))
+    setJsonError(null)
+    setDirty(true)
+    const ids = new Set([...document.graph.inputs.map((input) => input.id), ...document.graph.steps.map((step) => step.id)])
+    setSelectedId((current) => (current && ids.has(current) ? current : (document.graph.steps[0]?.id ?? document.graph.inputs[0]?.id ?? null)))
+  }
+
+  function documentForSave(): WorkflowJsonDocument | null {
+    if (!jsonEdited.current) return { name, description, graph }
+    const parsed = parseWorkflowJson(jsonText, { previous: graph })
+    if (!parsed.ok) {
+      setView('json')
+      setJsonError(parsed.errors.join('\n'))
+      return null
+    }
+    applyDocument(parsed.document)
+    return parsed.document
+  }
+
+  function openBuilder() {
+    if (jsonEdited.current) {
+      const parsed = parseWorkflowJson(jsonText, { previous: graph })
+      if (!parsed.ok) {
+        setJsonError(parsed.errors.join('\n'))
+        return
+      }
+      applyDocument(parsed.document)
+    }
+    setView('builder')
+  }
+
+  function onJsonKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== 'Tab') return
+    event.preventDefault()
+    const el = event.currentTarget
+    const start = el.selectionStart
+    const end = el.selectionEnd
+    const next = `${jsonText.slice(0, start)}  ${jsonText.slice(end)}`
+    jsonEdited.current = true
+    setJsonText(next)
+    setJsonError(null)
+    requestAnimationFrame(() => {
+      el.selectionStart = el.selectionEnd = start + 2
+    })
+  }
+
   async function save() {
     if (readOnly) return
+    const document = documentForSave()
+    if (!document) return
     try {
-      const next = await window.pipeline.saveWorkflow(workflowId, { name, description, graph })
+      const next = await window.pipeline.saveWorkflow(workflowId, {
+        name: document.name,
+        description: document.description,
+        graph: document.graph
+      })
       setDetails(next)
       setDirty(false)
+      snapshot.current = { ...snapshot.current, name: document.name, description: document.description, graph: document.graph, dirty: false }
       setRestored(false)
       notify(`Сохранено: версия ${next.version.version}`)
       if (version) onVersion(undefined)
@@ -174,7 +272,7 @@ export function WorkflowPage({
             <small>{input.type}</small>
           </button>
         ))}
-        {!readOnly && (
+        {!structureLocked && (
           <button
             className="ghost"
             type="button"
@@ -203,7 +301,7 @@ export function WorkflowPage({
               </div>
             ))}
         </div>
-        {!readOnly && (
+        {!structureLocked && (
           <div className="row" style={{ marginTop: 8 }}>
             {STEP_TYPES.map((type) => (
               <span key={type} className="type-chip">
@@ -227,11 +325,17 @@ export function WorkflowPage({
       <section className="inspector">
         <div className="split-head">
           <div>
-            <input className="inline-input" value={name} disabled={readOnly} onChange={(event) => { setName(event.target.value); setDirty(true) }} />
+            <input className="inline-input" value={name} disabled={readOnly || view === 'json'} onChange={(event) => { setName(event.target.value); setDirty(true) }} />
             <p className="meta">Версия {details.version.version}{dirty ? ' · черновик пишется сам' : ''}</p>
             {restored && <p className="meta">Черновик восстановлен после закрытия. «Сохранить версию» закрепит его.</p>}
           </div>
           <div className="row">
+            <button className={view === 'builder' ? 'btn' : 'ghost'} type="button" onClick={openBuilder}>
+              Конструктор
+            </button>
+            <button className={view === 'json' ? 'btn' : 'ghost'} type="button" onClick={() => setView('json')}>
+              JSON
+            </button>
             <select
               value={version ?? details.workflow.latestVersion}
               onChange={(event) => {
@@ -259,12 +363,48 @@ export function WorkflowPage({
             </button>
           </div>
         </div>
+        {view === 'builder' && (
         <label className="field">
           <span>Описание</span>
           <input value={description} disabled={readOnly} onChange={(event) => { setDescription(event.target.value); setDirty(true) }} />
         </label>
+        )}
         {readOnly && <div className="banner">Просмотр старой версии. Сохранение создаёт изменения только из последней версии.</div>}
         {error && <div className="error">{error}</div>}
+        {view === 'json' ? (
+          <div>
+            <p className="field-note">
+              Объект с полями name, description, inputs и steps. Его можно целиком собрать в модели и вставить сюда. id лучше не писать: для новых шагов приложение создаст свои, а уже существующие оставит по ключу. dependsOn пишется ключом шага. Если текст изменился, сохранение проверяет синтаксис, форму шагов и граф.
+            </p>
+            <div className="row" style={{ marginBottom: 8 }}>
+              <button
+                className="ghost"
+                type="button"
+                onClick={() => void copyText(jsonText).then(() => notify('JSON скопирован'))}
+              >
+                Копировать
+              </button>
+            </div>
+            <textarea
+              className="json-editor"
+              value={jsonText}
+              disabled={readOnly}
+              spellCheck={false}
+              wrap="off"
+              onChange={(event) => {
+                jsonEdited.current = true
+                setJsonText(event.target.value)
+                setJsonError(null)
+              }}
+              onKeyDown={onJsonKeyDown}
+            />
+            {jsonError && <div className="error">{jsonError}</div>}
+            {!jsonError && jsonText !== formatWorkflowJson({ name, description, graph }) && (
+              <p className="meta">JSON изменён. Проверка выполнится при сохранении или при возврате в конструктор.</p>
+            )}
+          </div>
+        ) : (
+          <>
         {!!issues.length && <div className="banner">{issues.join('\n')}</div>}
         {graph.inputs.find((input) => input.id === selectedId) && (
           <InputEditor
@@ -304,6 +444,8 @@ export function WorkflowPage({
               edit({ ...graph, steps: next.map((item, itemIndex) => ({ ...item, order: itemIndex + 1 })) })
             }}
           />
+        )}
+          </>
         )}
       </section>
     </div>
@@ -420,7 +562,7 @@ function StepEditor({
               order: step.order,
               dependsOn: step.dependsOn,
               stopAfter: step.stopAfter,
-              iterate: step.iterate
+              iterate: fresh.type === 'fanout' ? fresh.iterate : step.type === 'fanout' ? null : step.iterate
             })
           }}
         >
@@ -458,9 +600,10 @@ function StepEditor({
         <input type="checkbox" checked={step.stopAfter} disabled={readOnly} onChange={(event) => onChange({ ...step, stopAfter: event.target.checked })} />
         Остановиться после этого шага
       </label>
+      {step.type !== 'fanout' && (
       <fieldset>
         <legend className="section-label">Ветвление</legend>
-        <p className="field-note">Если предыдущий шаг вернул массив, этот шаг выполнится отдельно для каждого элемента. В запуске это видно как несколько вершин.</p>
+        <p className="field-note">Если предыдущий шаг вернул массив, этот шаг выполнится отдельно для каждого элемента. Для новой схемы удобнее отдельный шаг «Элементы», а этот переключатель оставлен для уже собранных цепочек.</p>
         <label className="check">
           <input
             type="checkbox"
@@ -499,9 +642,37 @@ function StepEditor({
                 <option value="manual">Вручную, по одной</option>
               </select>
             </label>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={Boolean(step.iterate.noteAlias)}
+                disabled={readOnly}
+                onChange={(event) =>
+                  onChange({
+                    ...step,
+                    iterate: { ...step.iterate!, noteAlias: event.target.checked ? step.iterate!.noteAlias || 'note' : '' }
+                  })
+                }
+              />
+              Свой текст для каждого элемента
+            </label>
+            {step.iterate.noteAlias ? (
+              <label className="field">
+                <span>Имя этого текста</span>
+                <input
+                  value={step.iterate.noteAlias}
+                  disabled={readOnly}
+                  onChange={(event) => onChange({ ...step, iterate: { ...step.iterate!, noteAlias: event.target.value } })}
+                />
+                <p className="field-note">
+                  Перед запуском элемента можно дописать текст. В этом шаге и внутри его веток он доступен как {`{{${step.iterate.noteAlias || 'note'}}}`}. Пустое поле подставится пустой строкой.
+                </p>
+              </label>
+            ) : null}
           </>
         )}
       </fieldset>
+      )}
       <StepConfig graph={graph} step={step} readOnly={readOnly} onChange={onChange} />
       {!readOnly && (
         <button className="danger" type="button" onClick={onDelete}>
@@ -646,6 +817,52 @@ function StepConfig({
       </div>
     )
   }
+  if (step.type === 'fanout') {
+    const iterate = step.iterate ?? { over: '', alias: 'item', launch: 'manual' as const }
+    return (
+      <div>
+        <p className="field-note">
+          Шаг только раскладывает массив. Шаги ниже него идут внутри каждой ветки, даже если ещё не запускались. Общим остаётся только шаг «Сборка», который собирает эти ветки. Элемент читается как{' '}
+          <code>{`{{steps.${step.key}.output}}`}</code> или <code>{`{{${iterate.alias || 'item'}}}`}</code>. Ручной текст добавляется отдельным ручным шагом после этого.
+        </p>
+        <TemplateField
+          label="Массив"
+          value={iterate.over}
+          graph={graph}
+          step={step}
+          readOnly={readOnly}
+          rows={2}
+          onChange={(over) => onChange({ ...step, type: 'fanout', iterate: { ...iterate, over }, config: {} })}
+        />
+        <label className="field">
+          <span>Имя элемента</span>
+          <input
+            value={iterate.alias}
+            disabled={readOnly}
+            onChange={(event) => onChange({ ...step, type: 'fanout', iterate: { ...iterate, alias: event.target.value }, config: {} })}
+          />
+        </label>
+        <label className="field">
+          <span>Запуск веток</span>
+          <select
+            value={iterate.launch}
+            disabled={readOnly}
+            onChange={(event) =>
+              onChange({
+                ...step,
+                type: 'fanout',
+                iterate: { ...iterate, launch: event.target.value as 'all' | 'manual' },
+                config: {}
+              })
+            }
+          >
+            <option value="all">Все сразу</option>
+            <option value="manual">Вручную, по одной</option>
+          </select>
+        </label>
+      </div>
+    )
+  }
   if (step.type === 'parse') {
     return (
       <div>
@@ -704,7 +921,7 @@ function StepConfig({
         <TemplateField label="Источник" value={step.config.source ?? ''} graph={graph} step={step} readOnly={readOnly} rows={2} onChange={(source) => onChange({ ...step, config: { ...step.config, source } })} />
         <label className="check">
           <input type="checkbox" checked={Boolean(step.config.allowEmpty)} disabled={readOnly} onChange={(event) => onChange({ ...step, config: { ...step.config, allowEmpty: event.target.checked } })} />
-          Можно ничего не выбирать
+          {step.type === 'manual' && step.config.mode === 'text' ? 'Можно оставить пустым' : 'Можно ничего не выбирать'}
         </label>
         <label className="field">
           <span>Если пропустить, не выполнять</span>

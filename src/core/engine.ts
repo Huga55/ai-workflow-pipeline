@@ -1,6 +1,6 @@
 import { inferKind } from '@core/labels'
 import { branchLabel } from '@core/labels'
-import { dependentIds, hiddenDescendantIds, innerDependents, isCollectMerge, topoSort } from '@core/graph'
+import { chainStepIds, fanoutInnerSteps, hiddenDescendantIds, isCollectMerge, topoSort } from '@core/graph'
 import { createId, nowIso } from '@core/ids'
 import { applyManualAction } from '@core/manual'
 import { createRunners, type StepRunner } from '@core/runners'
@@ -18,7 +18,7 @@ import type {
   VariableContext,
   WorkflowGraph
 } from '@core/types'
-import { resolveReference } from '@core/variables'
+import { previousStep, resolveReference } from '@core/variables'
 
 export type AdvanceOptions = {
   runId: string
@@ -33,6 +33,8 @@ export type AdvanceOptions = {
   focus?: { stepId: string; branchId: string; mode: 'only' | 'chain' }
   allowStepIds?: Set<string>
   forceStepIds?: Set<string>
+  branchNote?: string
+  appendBatch?: boolean
   signal?: AbortSignal
   onProgress?: () => void
 }
@@ -45,6 +47,8 @@ type Scope = {
   alias: string | null
   item: unknown
   index: number | null
+  note: string
+  noteAlias: string
 }
 
 export class WorkflowEngine {
@@ -61,7 +65,7 @@ export class WorkflowEngine {
     if (options.retry) return this.runSingle(options, options.retry.stepId, options.retry.branchId)
     if (options.focus?.mode === 'only') return this.runSingle(options, options.focus.stepId, options.focus.branchId)
     if (options.focus?.mode === 'chain') {
-      const allow = dependentIds(options.focus.stepId, options.graph.steps)
+      const allow = chainStepIds(options.focus.stepId, options.graph.steps)
       return this.advanceScope(this.rootScope(options.runId), options.graph.steps, {
         ...options,
         allowStepIds: allow,
@@ -94,7 +98,7 @@ export class WorkflowEngine {
     execution.finishedAt = finished
     execution.durationMs = execution.startedAt ? Date.parse(finished) - Date.parse(execution.startedAt) : 0
     this.store.updateExecution(execution)
-    if (!applied.skipped) this.store.insertArtifact(this.artifact(options.runId, execution.id, applied.output))
+    this.store.insertArtifact(this.artifact(options.runId, execution.id, applied.output ?? null))
     this.store.insertUserAction({
       id: createId(),
       runId: options.runId,
@@ -147,7 +151,7 @@ export class WorkflowEngine {
       existing.finishedAt = nowIso()
       existing.error = null
       this.store.updateExecution(existing)
-      if (output != null) this.store.insertArtifact(this.artifact(options.runId, existing.id, output))
+      this.store.insertArtifact(this.artifact(options.runId, existing.id, output ?? null))
       return
     }
     const started = nowIso()
@@ -169,7 +173,7 @@ export class WorkflowEngine {
       createdAt: started
     }
     this.store.insertExecution(execution)
-    if (output != null) this.store.insertArtifact(this.artifact(options.runId, execution.id, output))
+    this.store.insertArtifact(this.artifact(options.runId, execution.id, output ?? null))
   }
 
   private async runSingle(options: AdvanceOptions, stepId: string, branchId: string): Promise<AdvanceResult> {
@@ -195,19 +199,21 @@ export class WorkflowEngine {
       entryStepId: null,
       alias: null,
       item: undefined,
-      index: null
+      index: null,
+      note: '',
+      noteAlias: ''
     }
   }
 
   private async advanceScope(scope: Scope, steps: StepDefinition[], options: AdvanceOptions): Promise<AdvanceResult> {
-    if (options.signal?.aborted) return 'cancelled'
+    if (options.signal?.aborted) return 'paused'
     const hidden = hiddenDescendantIds(steps, scope.entryStepId)
     const local = steps.filter((step) => !hidden.has(step.id))
     const sorted = topoSort(local)
     if (!sorted.ok) return this.failScope(scope, options, sorted.message)
 
     for (const step of sorted.steps) {
-      if (options.signal?.aborted) return 'cancelled'
+      if (options.signal?.aborted) return 'paused'
       if (options.allowStepIds && !this.stepAllowed(step, steps, options.allowStepIds)) continue
       if (step.iterate && step.id !== scope.entryStepId) {
         const fanout = await this.runFanout(step, steps, scope, options, false)
@@ -221,7 +227,7 @@ export class WorkflowEngine {
         this.setBranchStatus(options.runId, scope.branchId, 'waiting_for_user')
         return 'paused'
       }
-      if (!force && existing?.status === 'failed') return 'failed'
+      if (!force && existing?.status === 'failed' && !existing.meta.interrupted) return 'failed'
       if (!force && existing?.status === 'cancelled') return 'paused'
       if (existing?.status === 'running') return 'paused'
 
@@ -248,12 +254,13 @@ export class WorkflowEngine {
     if (!step.iterate) return 'failed'
     const refresh = Boolean(options.forceStepIds?.has(step.id))
     let branches = this.childBranches(options.runId, scope.branchId, step.id)
+    let preserved = new Set<string>()
     const errorExecution = this.effectiveExecution(options.runId, step.id, scope.branchId)
     if (!branches.length && errorExecution?.meta.fanoutError && errorExecution.status === 'failed' && !force && !refresh) {
       return 'failed'
     }
     if (!branches.length || refresh) {
-      const resolved = resolveReference(step.iterate.over, this.buildContext(scope, options))
+      const resolved = resolveReference(step.iterate.over, this.buildContext(scope, options, step))
       if (!resolved.ok || !Array.isArray(resolved.value)) {
         await this.writeFanoutError(
           step,
@@ -264,36 +271,42 @@ export class WorkflowEngine {
         return 'failed'
       }
       if (!branches.length) {
-        branches = resolved.value.map((item, index) => this.makeBranch(scope, step, options.runId, item, index))
+        branches = resolved.value.map((item, index) => this.makeBranch(scope, step, options.runId, item, index, 0))
       } else {
-        resolved.value.forEach((item, index) => {
-          const existing = branches.find((branch) => branch.itemIndex === index)
-          if (!existing) {
-            branches.push(this.makeBranch(scope, step, options.runId, item, index))
-            return
-          }
-          existing.item = item
-          existing.label = branchLabel(item, index)
-          existing.alias = step.iterate?.alias || existing.alias
-          existing.status = 'pending'
-          this.store.updateBranch(existing)
-        })
-        for (const branch of branches) {
-          if (branch.itemIndex < resolved.value.length) continue
-          branch.status = 'cancelled'
-          this.store.updateBranch(branch)
+        const active = branches
+          .filter((branch) => branch.status !== 'cancelled')
+          .sort((a, b) => a.itemIndex - b.itemIndex)
+        if (options.appendBatch || active.length !== resolved.value.length) {
+          preserved = new Set(branches.map((branch) => branch.id))
+          const nextIndex = branches.reduce((max, branch) => Math.max(max, branch.itemIndex), -1) + 1
+          const nextBatch = branches.reduce((max, branch) => Math.max(max, branch.batch ?? 0), -1) + 1
+          resolved.value.forEach((item, index) => {
+            branches.push(this.makeBranch(scope, step, options.runId, item, nextIndex + index, nextBatch))
+          })
+        } else {
+          resolved.value.forEach((item, index) => {
+            const existing = active[index]
+            existing.item = item
+            existing.label = branchLabel(item, existing.itemIndex)
+            existing.alias = step.iterate?.alias || existing.alias
+            existing.noteAlias = step.iterate?.noteAlias?.trim() ?? ''
+            existing.status = 'pending'
+            this.store.updateBranch(existing)
+          })
         }
         branches = this.childBranches(options.runId, scope.branchId, step.id)
       }
       options.onProgress?.()
     }
 
-    const inner = [step, ...innerDependents(step.id, allSteps)]
+    const inner = [step, ...fanoutInnerSteps(step.id, allSteps)]
+    const jobs: { fresh: Branch; child: Scope; branchOptions: AdvanceOptions }[] = []
     for (const branch of branches) {
-      if (options.signal?.aborted) return 'cancelled'
+      if (options.signal?.aborted) return 'paused'
       const fresh = this.store.listBranches(options.runId).find((item) => item.id === branch.id) ?? branch
       if (fresh.status === 'cancelled') continue
-      const forceInner = inner.some((item) => options.forceStepIds?.has(item.id))
+      const keep = preserved.has(fresh.id)
+      const forceInner = !keep && inner.some((item) => options.forceStepIds?.has(item.id))
       if (fresh.status === 'completed' && !forceInner) continue
       const selected = this.shouldRunBranch(fresh.id, options.onlyBranchId, options.runId)
       if (!selected) continue
@@ -301,19 +314,47 @@ export class WorkflowEngine {
         const exact = options.onlyBranchId === fresh.id
         if (!exact && !options.startManualBranches) continue
       }
+      if (options.onlyBranchId === fresh.id && options.branchNote !== undefined) fresh.note = options.branchNote
       const child = this.childScope(scope, fresh, step.id)
-      const redo = fresh.status === 'pending' && inner.some((item) => Boolean(this.effectiveExecution(options.runId, item.id, fresh.id)))
-      fresh.status = 'running'
-      this.store.updateBranch(fresh)
-      const branchOptions = redo
-        ? { ...options, forceStepIds: new Set([...(options.forceStepIds ?? []), ...inner.map((item) => item.id)]) }
-        : options
-      const result = await this.advanceScope(child, inner, branchOptions)
-      if (result === 'completed') this.setBranchStatus(options.runId, fresh.id, 'completed')
-      else if (result === 'failed') this.setBranchStatus(options.runId, fresh.id, 'failed')
-      else if (result === 'cancelled') this.setBranchStatus(options.runId, fresh.id, 'cancelled')
-      else this.refreshBranchStatus(options.runId, fresh.id)
-      if (result === 'cancelled') return 'cancelled'
+      const redo = !keep && fresh.status === 'pending' && inner.some((item) => Boolean(this.effectiveExecution(options.runId, item.id, fresh.id)))
+      const branchOptions = keep
+        ? { ...options, forceStepIds: new Set([...(options.forceStepIds ?? [])].filter((id) => !inner.some((item) => item.id === id))) }
+        : redo
+          ? { ...options, forceStepIds: new Set([...(options.forceStepIds ?? []), ...inner.map((item) => item.id)]) }
+          : options
+      jobs.push({ fresh, child, branchOptions })
+    }
+
+    const finish = async (job: (typeof jobs)[number]) => {
+      job.fresh.status = 'running'
+      this.store.updateBranch(job.fresh)
+      const result = await this.advanceScope(job.child, inner, job.branchOptions)
+      if (options.signal?.aborted) {
+        if (result === 'completed') this.setBranchStatus(options.runId, job.fresh.id, 'completed')
+        else this.keepBranchAfterStop(options.runId, job.fresh.id)
+        return result === 'completed' ? 'completed' : 'paused'
+      }
+      if (result === 'completed') this.setBranchStatus(options.runId, job.fresh.id, 'completed')
+      else if (result === 'failed') this.setBranchStatus(options.runId, job.fresh.id, 'failed')
+      else if (result === 'cancelled') this.setBranchStatus(options.runId, job.fresh.id, 'cancelled')
+      else this.refreshBranchStatus(options.runId, job.fresh.id)
+      return result
+    }
+    if (step.iterate.launch === 'all') {
+      for (const job of jobs) {
+        job.fresh.status = 'running'
+        this.store.updateBranch(job.fresh)
+      }
+      if (jobs.length) options.onProgress?.()
+      const results = await Promise.all(jobs.map((job) => finish(job)))
+      if (options.signal?.aborted) return 'paused'
+      if (results.includes('cancelled')) return 'cancelled'
+    } else {
+      for (const job of jobs) {
+        const result = await finish(job)
+        if (options.signal?.aborted) return 'paused'
+        if (result === 'cancelled') return 'cancelled'
+      }
     }
 
     const after = this.childBranches(options.runId, scope.branchId, step.id)
@@ -330,7 +371,7 @@ export class WorkflowEngine {
     if (!force && existing) {
       if (existing.status === 'completed' || existing.status === 'skipped') return 'completed'
       if (existing.status === 'waiting_for_user') return 'paused'
-      if (existing.status === 'failed') return 'failed'
+      if (existing.status === 'failed' && !existing.meta.interrupted) return 'failed'
       if (existing.status === 'cancelled') return 'paused'
       if (existing.status === 'running') return 'paused'
     }
@@ -361,13 +402,23 @@ export class WorkflowEngine {
     try {
       outcome = await this.runners[step.type]({
         step,
-        ctx: this.buildContext(scope, options),
+        ctx: this.buildContext(scope, options, step),
         graph: options.graph,
         signal: options.signal,
         collectOutputs: (fanoutStepId, fromStepId) => this.collectOutputs(options.runId, scope.branchId, fanoutStepId, fromStepId)
       })
     } catch (error) {
       outcome = { status: 'failed', error: error instanceof Error ? error.message : 'Ошибка шага', rawResponse: null }
+    }
+    if (outcome.status !== 'completed' && outcome.status !== 'waiting_for_user' && (options.signal?.aborted || isAbortError(outcome.error))) {
+      outcome = {
+        status: 'failed',
+        error: 'Остановлено',
+        request: outcome.request,
+        rawResponse: outcome.rawResponse ?? null,
+        parsed: outcome.parsed,
+        meta: { ...(outcome.meta ?? {}), interrupted: true }
+      }
     }
 
     const finished = nowIso()
@@ -422,7 +473,7 @@ export class WorkflowEngine {
     })
   }
 
-  private buildContext(scope: Scope, options: AdvanceOptions): VariableContext {
+  private buildContext(scope: Scope, options: AdvanceOptions, step?: StepDefinition): VariableContext {
     const aliases: Record<string, unknown> = {}
     let currentItem: unknown
     let currentIndex: number | undefined
@@ -435,13 +486,17 @@ export class WorkflowEngine {
       if (cursor.alias && !Object.prototype.hasOwnProperty.call(aliases, cursor.alias)) {
         aliases[cursor.alias] = cursor.item
       }
+      if (cursor.noteAlias && !Object.prototype.hasOwnProperty.call(aliases, cursor.noteAlias)) {
+        aliases[cursor.noteAlias] = cursor.note ?? ''
+      }
       cursor = cursor.parent
     }
     const steps: VariableContext['steps'] = {}
-    for (const step of options.graph.steps) {
-      const output = this.findOutput(options.runId, step.id, scope)
-      if (output !== undefined) steps[step.key] = { output }
+    for (const item of options.graph.steps) {
+      const output = this.findOutput(options.runId, item.id, scope)
+      if (output !== undefined) steps[item.key] = { output }
     }
+    const previous = step ? previousStep(step, options.graph.steps) : null
     return {
       inputs: options.inputs,
       steps,
@@ -449,26 +504,30 @@ export class WorkflowEngine {
       current_index: currentIndex,
       aliases,
       globals: options.globals ?? {},
-      project: options.project ?? {}
+      project: options.project ?? {},
+      prev: previous ? { output: this.findOutput(options.runId, previous.id, scope) } : undefined
     }
   }
 
   private stepAllowed(step: StepDefinition, steps: StepDefinition[], allow: Set<string>): boolean {
     if (allow.has(step.id)) return true
     if (!step.iterate) return false
-    return innerDependents(step.id, steps).some((item) => allow.has(item.id))
+    return fanoutInnerSteps(step.id, steps).some((item) => allow.has(item.id))
   }
 
-  private makeBranch(scope: Scope, step: StepDefinition, runId: string, item: unknown, index: number): Branch {
+  private makeBranch(scope: Scope, step: StepDefinition, runId: string, item: unknown, index: number, batch: number): Branch {
     const branch: Branch = {
       id: createId(),
       runId,
       parentBranchId: scope.branchId,
       sourceStepId: step.id,
       itemIndex: index,
+      batch,
       alias: step.iterate?.alias || 'current_item',
       label: branchLabel(item, index),
       item,
+      note: '',
+      noteAlias: step.iterate?.noteAlias?.trim() ?? '',
       status: 'pending'
     }
     this.store.insertBranch(branch)
@@ -543,7 +602,9 @@ export class WorkflowEngine {
       entryStepId,
       alias: branch.alias,
       item: branch.item,
-      index: branch.itemIndex
+      index: branch.itemIndex,
+      note: branch.note ?? '',
+      noteAlias: branch.noteAlias ?? ''
     }
   }
 
@@ -575,6 +636,12 @@ export class WorkflowEngine {
       value,
       createdAt: nowIso()
     }
+  }
+
+  private keepBranchAfterStop(runId: string, branchId: string): void {
+    const branch = this.store.listBranches(runId).find((item) => item.id === branchId)
+    if (!branch || branch.status === 'waiting_for_user' || branch.status === 'cancelled' || branch.status === 'completed') return
+    this.setBranchStatus(runId, branchId, 'paused')
   }
 
   private setBranchStatus(runId: string, branchId: string, status: BranchStatus): void {
@@ -637,6 +704,11 @@ export class WorkflowEngine {
     this.store.insertExecution(execution)
     return 'failed'
   }
+}
+
+export function isAbortError(error: string | null | undefined): boolean {
+  if (!error) return false
+  return error === 'Остановлено' || /abort/i.test(error)
 }
 
 export function settleRunStatus(result: AdvanceResult, store: EngineStore, runId: string, graph: WorkflowGraph): 'paused' | 'completed' | 'failed' | 'cancelled' {

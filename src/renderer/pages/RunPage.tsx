@@ -1,8 +1,11 @@
 import { useEffect, useState } from 'react'
-import { hiddenDescendantIds, innerDependents, topoSort } from '@core/graph'
+import { chainStepIds } from '@core/graph'
+import { pretty } from '@core/labels'
 import { isStoredFile, toMediaUrl } from '@core/media'
+import { runVersionFit, type RunVersionFit } from '@core/run-version'
 import type { RunDetails, StepDefinition, StepExecution, StoredFile, UserActionPayload } from '@core/types'
-import { copyText, errorText, JsonView, StatusPill, whenText } from '../ui'
+import { RunCanvas, type CanvasNode } from '../run-canvas'
+import { copyText, errorText, JsonView, Modal, StatusPill, whenText } from '../ui'
 
 export function RunPage({
   runId,
@@ -22,11 +25,31 @@ export function RunPage({
   const [busy, setBusy] = useState(false)
   const [untilStepId, setUntilStepId] = useState('')
   const [title, setTitle] = useState('')
+  const [selected, setSelected] = useState<CanvasNode | null>(null)
+  const [versions, setVersions] = useState<number[]>([])
+  const [versionChoice, setVersionChoice] = useState<{ version: number; fit: RunVersionFit } | null>(null)
 
   async function reload() {
     const next = await window.pipeline.getRun(runId)
     setDetails(next)
     setTitle((current) => (current ? current : next.run.title))
+    const workflow = await window.pipeline.getWorkflow(next.run.workflowId)
+    setVersions(workflow.versions.map((item) => item.version).sort((a, b) => a - b))
+  }
+
+  async function chooseVersion(version: number) {
+    if (!details || version === details.versionNumber) return
+    const workflow = await window.pipeline.getWorkflow(details.run.workflowId, version)
+    setVersionChoice({ version, fit: runVersionFit(details.graph, workflow.version.graph, details) })
+  }
+
+  function applyVersion(version: number) {
+    setVersionChoice(null)
+    void act(async () => {
+      const next = await window.pipeline.setRunVersion(runId, version)
+      notify(`Схема запуска: v${version}`)
+      return next
+    })
   }
 
   useEffect(() => {
@@ -71,8 +94,22 @@ export function RunPage({
           />
           <p className="lede">
             <button className="ghost" type="button" onClick={() => onOpenWorkflow(run.workflowId, details.versionNumber)}>
-              {details.workflowName} v{details.versionNumber}
+              {details.workflowName}
             </button>
+            {typeof window.pipeline.setRunVersion === 'function' && versions.length > 0 && (
+              <select
+                aria-label="Версия схемы"
+                value={details.versionNumber}
+                disabled={busy || run.status === 'running'}
+                onChange={(event) => void chooseVersion(Number(event.target.value)).catch((reason) => setError(errorText(reason)))}
+              >
+                {versions.map((version) => (
+                  <option key={version} value={version}>
+                    v{version}
+                  </option>
+                ))}
+              </select>
+            )}
             {' · '}
             {whenText(run.createdAt)}
           </p>
@@ -128,9 +165,41 @@ export function RunPage({
       {error && <div className="error">{error}</div>}
       {run.error && <div className="error">{run.error}</div>}
       {!started && <InputForm details={details} busy={busy} onSaved={setDetails} onError={setError} />}
-      <div style={{ marginTop: 22 }}>
-        <ScopeView details={details} parentBranchId="" entryStepId={null} busy={busy} act={act} notify={notify} />
+      <div className="run-board">
+        <RunCanvas details={details} selectedId={selected?.id ?? null} onSelect={setSelected} />
+        <CanvasDock details={details} node={selected} busy={busy} act={act} notify={notify} />
       </div>
+      {versionChoice && (
+        <Modal title={versionChoice.fit.ok ? `Перейти на v${versionChoice.version}` : 'Версия не подходит'} onClose={() => setVersionChoice(null)}>
+          {versionChoice.fit.ok ? (
+            <>
+              <p className="lede">
+                Уже выполненные шаги останутся как есть. Следующий запуск шага возьмёт текст и настройки из v{versionChoice.version}.
+              </p>
+              <div className="row">
+                <button className="btn" type="button" disabled={busy} onClick={() => applyVersion(versionChoice.version)}>
+                  Применить
+                </button>
+                <button className="ghost" type="button" onClick={() => setVersionChoice(null)}>
+                  Отмена
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="lede">Эта версия меняет уже выполненные шаги так, что старые результаты нельзя продолжить.</p>
+              {versionChoice.fit.reasons.map((reason) => (
+                <p key={reason} className="meta">
+                  {reason}
+                </p>
+              ))}
+              <button className="btn" type="button" onClick={() => setVersionChoice(null)}>
+                Понятно
+              </button>
+            </>
+          )}
+        </Modal>
+      )}
     </div>
   )
 }
@@ -329,98 +398,82 @@ function InputControl({
   )
 }
 
-function ScopeView({
+function CanvasDock({
   details,
-  steps,
-  parentBranchId,
-  entryStepId,
-  depth = 0,
+  node,
   busy,
   act,
   notify
 }: {
   details: RunDetails
-  steps?: StepDefinition[]
-  parentBranchId: string
-  entryStepId: string | null
-  depth?: number
+  node: CanvasNode | null
   busy: boolean
   act: (work: () => Promise<RunDetails>) => Promise<void>
   notify: (message: string) => void
 }) {
-  const source = steps ?? details.graph.steps
-  const hidden = hiddenDescendantIds(source, entryStepId)
-  const local = source.filter((step) => !hidden.has(step.id))
-  const sorted = topoSort(local)
-  if (!sorted.ok) return <div className="error">{sorted.message}</div>
+  const [note, setNote] = useState('')
+  useEffect(() => {
+    const branch = node ? details.branches.find((item) => item.id === node.branchId) : undefined
+    setNote(branch?.note ?? '')
+  }, [node?.id])
+  if (!node) {
+    return (
+      <aside className="canvas-dock">
+        <p className="lede">Холст запуска. Цепочка идёт сверху вниз, элементы одного ветвления стоят в ряд.</p>
+        <p className="meta">Выберите шаг. Колесо меняет масштаб, пустое место можно перетаскивать.</p>
+      </aside>
+    )
+  }
+  const step = details.graph.steps.find((item) => item.id === node.stepId)
+  const branch = details.branches.find((item) => item.id === node.branchId)
+  if (!step) return null
+  const noteAlias = step.iterate?.noteAlias?.trim() ?? ''
   return (
-    <div className="flow">
-      {sorted.steps.map((step, index) => (
-        <div key={step.id} className="flow-col">
-          {index > 0 && <div className="flow-edge" />}
-          {step.iterate && step.id !== entryStepId ? (
-            <FanoutView details={details} step={step} source={source} parentBranchId={parentBranchId} depth={depth} busy={busy} act={act} notify={notify} />
-          ) : (
-            <ExecutionCard details={details} step={step} branchId={parentBranchId} busy={busy} act={act} notify={notify} />
-          )}
-        </div>
-      ))}
-    </div>
-  )
-}
-
-function FanoutView({
-  details,
-  step,
-  source,
-  parentBranchId,
-  depth,
-  busy,
-  act,
-  notify
-}: {
-  details: RunDetails
-  step: StepDefinition
-  source: StepDefinition[]
-  parentBranchId: string
-  depth: number
-  busy: boolean
-  act: (work: () => Promise<RunDetails>) => Promise<void>
-  notify: (message: string) => void
-}) {
-  const branches = details.branches
-    .filter((branch) => branch.parentBranchId === parentBranchId && branch.sourceStepId === step.id)
-    .sort((a, b) => a.itemIndex - b.itemIndex)
-  const marker = latest(details.executions, step.id, parentBranchId)
-  const inner = [step, ...innerDependents(step.id, source)]
-  return (
-    <div className="flow-fan">
-      <article className="flow-node static">
-        <strong>{step.name}</strong>
-        <span className="meta">{branches.length ? `${branches.length} веток` : 'ветвление по массиву'}</span>
-        <RunActions details={details} step={step} branchId={parentBranchId} busy={busy} act={act} />
-      </article>
-      {marker?.meta.fanoutError && <div className="error">{marker.error}</div>}
-      <div className={`flow-branches${depth > 0 ? ' nested' : ''}`}>
-        {branches.map((branch) => (
-          <div key={branch.id} className="flow-branch">
-            <div className="flow-edge" />
-            <div className="branch-head">
-              <div className="row">
-                <strong>{branch.label}</strong>
-                <StatusPill status={branch.status} />
-              </div>
-              {branch.status === 'pending' && (
-                <button className="btn" type="button" disabled={busy} onClick={() => void act(() => window.pipeline.continueRun(details.run.id, { branchId: branch.id }))}>
-                  Продолжить эту ветку
-                </button>
-              )}
-            </div>
-            <ScopeView details={details} steps={inner} parentBranchId={branch.id} entryStepId={step.id} depth={depth + 1} busy={busy} act={act} notify={notify} />
+    <aside className="canvas-dock">
+      {node.role === 'item' && branch && (
+        <>
+          <div className="row">
+            <span className="branch-num">{branch.itemIndex + 1}</span>
+            <strong>{branch.label}</strong>
+            <StatusPill status={branch.status} />
           </div>
-        ))}
-      </div>
-    </div>
+          <pre className="branch-item">{pretty(branch.item)}</pre>
+          {noteAlias && branch.status === 'pending' && (
+            <label className="field">
+              <span>Текст для этого элемента · {`{{${noteAlias}}}`}</span>
+              <textarea rows={4} value={note} placeholder="Можно оставить пустым" onChange={(event) => setNote(event.target.value)} />
+            </label>
+          )}
+          {(branch.status === 'pending' || branch.status === 'paused') && (
+            <button
+              className="btn"
+              type="button"
+              disabled={busy}
+              onClick={() =>
+                void act(() =>
+                  window.pipeline.continueRun(details.run.id, {
+                    branchId: branch.id,
+                    note: noteAlias && branch.status === 'pending' ? note : undefined
+                  })
+                )
+              }
+            >
+              Продолжить эту ветку
+            </button>
+          )}
+        </>
+      )}
+      {node.role === 'split' && (
+        <>
+          <strong>{step.name}</strong>
+          <p className="field-note">
+            Этот шаг только раскладывает массив. Элемент в следующих шагах ветки — <code>{`{{steps.${step.key}.output}}`}</code>.
+          </p>
+          <RunActions details={details} step={step} branchId={node.branchId} busy={busy} act={act} />
+        </>
+      )}
+      <ExecutionCard details={details} step={step} branchId={node.branchId} busy={busy} act={act} notify={notify} />
+    </aside>
   )
 }
 
@@ -544,25 +597,39 @@ function RunActions({
   busy: boolean
   act: (work: () => Promise<RunDetails>) => Promise<void>
 }) {
+  const [appendBatch, setAppendBatch] = useState(false)
   if (details.run.status === 'running') return null
   const latest = details.executions
     .filter((item) => item.stepId === step.id && item.branchId === branchId && !item.meta.fanoutError)
     .sort((a, b) => b.attempt - a.attempt)[0]
   const canSkip = !latest || (latest.status !== 'completed' && latest.status !== 'skipped' && latest.status !== 'running' && latest.status !== 'waiting_for_user')
+  const chain = chainStepIds(step.id, details.graph.steps)
+  const canAppend = details.graph.steps.some((item) => item.iterate && chain.has(item.id))
+  const runAgain = (mode: 'only' | 'chain') =>
+    window.pipeline.runStep(details.run.id, step.id, branchId, mode, appendBatch ? { appendBatch: true } : undefined)
   return (
-    <div className="row">
-      <button className="btn" type="button" disabled={busy} onClick={() => void act(() => window.pipeline.runStep(details.run.id, step.id, branchId, 'only'))}>
-        Только этот шаг
-      </button>
-      <button className="ghost" type="button" disabled={busy} onClick={() => void act(() => window.pipeline.runStep(details.run.id, step.id, branchId, 'chain'))}>
-        Отсюда дальше
-      </button>
-      {canSkip && (
-        <button className="ghost" type="button" disabled={busy} onClick={() => void act(() => window.pipeline.skipStep(details.run.id, step.id, branchId))}>
-          Пропустить
-        </button>
+    <>
+      {canAppend && (
+        <label className="check">
+          <input type="checkbox" checked={appendBatch} onChange={(event) => setAppendBatch(event.target.checked)} />
+          Новый ряд
+        </label>
       )}
-    </div>
+      {canAppend && <p className="field-note">Если элементов столько же, они добавятся следующим рядом и не заменят текущие.</p>}
+      <div className="row">
+        <button className="btn" type="button" disabled={busy} onClick={() => void act(() => runAgain('only'))}>
+          Только этот шаг
+        </button>
+        <button className="ghost" type="button" disabled={busy} onClick={() => void act(() => runAgain('chain'))}>
+          Отсюда дальше
+        </button>
+        {canSkip && (
+          <button className="ghost" type="button" disabled={busy} onClick={() => void act(() => window.pipeline.skipStep(details.run.id, step.id, branchId))}>
+            Пропустить
+          </button>
+        )}
+      </div>
+    </>
   )
 }
 
@@ -655,8 +722,8 @@ function ManualForm({
           <textarea rows={8} value={text} onChange={(event) => setText(event.target.value)} />
         </label>
         <div className="row">
-          <button className="btn" type="button" disabled={busy} onClick={() => onSubmit({ type: 'text', text })}>
-            Отправить ответы
+          <button className="btn" type="button" disabled={busy || (!waiting.allowEmpty && !text.trim())} onClick={() => onSubmit({ type: 'text', text })}>
+            {waiting.allowEmpty && !text.trim() ? 'Продолжить без текста' : 'Сохранить текст'}
           </button>
           <SkipFollowup details={details} waiting={waiting} busy={busy} onSubmit={onSubmit} />
         </div>

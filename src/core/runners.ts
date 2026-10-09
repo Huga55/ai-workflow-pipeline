@@ -35,6 +35,7 @@ export function createRunners(deps: RunnerDeps = {}): Record<StepDefinition['typ
     input: runInput,
     transform: runTransform,
     parse: runParse,
+    fanout: runFanout,
     manual: runManual,
     merge: runMerge,
     ai: async (ctx) => {
@@ -158,6 +159,14 @@ async function runParse({ step, ctx }: StepRunContext): Promise<StepOutcome> {
   }
 }
 
+async function runFanout({ step, ctx }: StepRunContext): Promise<StepOutcome> {
+  if (step.type !== 'fanout') return { status: 'failed', error: 'Неверный тип шага' }
+  const alias = step.iterate?.alias
+  const output = alias && Object.prototype.hasOwnProperty.call(ctx.aliases, alias) ? ctx.aliases[alias] : ctx.current_item
+  if (output === undefined) return { status: 'failed', error: 'Элемент ветки не найден', rawResponse: null }
+  return { status: 'completed', output, rawResponse: null }
+}
+
 async function runManual({ step, ctx }: StepRunContext): Promise<StepOutcome> {
   if (step.type !== 'manual') return { status: 'failed', error: 'Неверный тип шага' }
   const config = step.config
@@ -181,7 +190,10 @@ async function runManual({ step, ctx }: StepRunContext): Promise<StepOutcome> {
     )
   }
   if (config.mode === 'text') {
-    return waitingOutcome({ mode: 'text', prompt: config.prompt, value: source, skipStepIds: config.skipStepIds }, { source })
+    return waitingOutcome(
+      { mode: 'text', prompt: config.prompt, value: source, allowEmpty: config.allowEmpty, skipStepIds: config.skipStepIds },
+      { source }
+    )
   }
   if (config.mode === 'confirm' || config.mode === 'edit_json') {
     return waitingOutcome({ mode: config.mode, prompt: config.prompt, value: source, skipStepIds: config.skipStepIds }, { source })

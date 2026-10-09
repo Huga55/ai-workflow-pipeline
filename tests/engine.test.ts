@@ -8,7 +8,8 @@ import { MemoryStore } from '@core/memory-store'
 import { createRunners } from '@core/runners'
 import { createNeurophotoGraph } from '@core/template'
 import type { StepDefinition, WorkflowGraph } from '@core/types'
-import { interpolate, resolvePath } from '@core/variables'
+import { applyManualAction } from '@core/manual'
+import { interpolate, previousStep, resolvePath, variableCatalog } from '@core/variables'
 
 function expect(actual: unknown) {
   return {
@@ -74,6 +75,35 @@ describe('variables', () => {
     expect(resolved).toEqual({ ok: true, value: 'Quiet Finish' })
   })
 
+  it('reads the previous step output through prev', () => {
+    const resolved = resolvePath('prev.output.title', {
+      inputs: {},
+      steps: {},
+      aliases: {},
+      prev: { output: { title: 'Hero' } }
+    })
+    expect(resolved).toEqual({ ok: true, value: 'Hero' })
+    const missing = resolvePath('prev.output', { inputs: {}, steps: {}, aliases: {} })
+    expect(missing.ok).toBe(false)
+  })
+
+  it('offers prev for the step that depends on the previous one', () => {
+    const first = step({ id: 'a', key: 'make', type: 'transform', order: 1, config: { mode: 'template', template: 'a' } })
+    const second = step({
+      id: 'b',
+      key: 'use',
+      type: 'transform',
+      order: 2,
+      dependsOn: ['a'],
+      config: { mode: 'template', template: '' }
+    })
+    expect(previousStep(second, [first, second])?.key).toBe('make')
+    expect(previousStep(first, [first, second])).toBe(null)
+    const group = variableCatalog(graph([first, second]), second).find((item) => item.title === 'Предыдущий')
+    expect(group?.items[0]?.path).toBe('prev.output')
+    expect(group?.items[0]?.hint).toBe('make')
+  })
+
   it('keeps images out of interpolated text', () => {
     const value = interpolate('Кадр {{current_item.title}}', {
       inputs: {},
@@ -120,6 +150,311 @@ describe('engine', () => {
     expect(await run(engine, store, steps)).toBe('completed')
     const output = store.artifacts.at(-1)
     expect(output?.value).toBe('Cream')
+  })
+
+  it('uses prev as the output of the direct dependency', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'a',
+        key: 'make',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return { product_identifiers: { name: "Cream" } };' }
+      }),
+      step({
+        id: 'b',
+        key: 'use',
+        type: 'transform',
+        order: 2,
+        dependsOn: ['a'],
+        config: { mode: 'template', template: '{{prev.output.product_identifiers.name}}' }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('completed')
+    expect(store.artifacts.at(-1)?.value).toBe('Cream')
+  })
+
+  it('sends an optional per-item note into that branch', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }, { title: "B" }];' }
+      }),
+      step({
+        id: 'shots',
+        key: 'shots',
+        type: 'transform',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'item', launch: 'manual', noteAlias: 'note' },
+        config: { mode: 'template', template: '{{item.title}} / {{note}}' }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('paused')
+    const pending = store.branches.filter((branch) => branch.sourceStepId === 'shots')
+    expect(pending).toHaveLength(2)
+    const first = pending.find((branch) => branch.itemIndex === 0)
+    expect(first).toBeTruthy()
+    expect(
+      await engine.advance({
+        runId: 'run',
+        graph: graph(steps),
+        inputs: {},
+        onlyBranchId: first?.id,
+        branchNote: 'крупнее'
+      })
+    ).toBe('paused')
+    const done = store.executions.find((item) => item.stepId === 'shots' && item.branchId === first?.id && item.status === 'completed')
+    expect(store.artifacts.find((item) => item.stepExecutionId === done?.id)?.value).toBe('A / крупнее')
+    expect(store.branches.find((branch) => branch.itemIndex === 1)?.status).toBe('pending')
+  })
+
+  it('lets a fanout step hand each item to the next step', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }, { title: "B" }];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'item', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'use',
+        key: 'use',
+        type: 'transform',
+        order: 3,
+        dependsOn: ['items'],
+        config: { mode: 'template', template: '{{steps.items.output.title}}' }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('completed')
+    const values = store.executions
+      .filter((item) => item.stepId === 'use' && item.status === 'completed')
+      .map((item) => store.artifacts.find((artifact) => artifact.stepExecutionId === item.id)?.value)
+    expect(values).toEqual(['A', 'B'])
+  })
+
+  it('runs all-at-once branches at the same time', async () => {
+    const store = new MemoryStore()
+    let started = 0
+    let release: () => void = () => undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const runners = createRunners()
+    runners.ai = async (context) => {
+      started += 1
+      await gate
+      const item = context.ctx.aliases.item as { title: string }
+      return { status: 'completed', output: item.title, rawResponse: item.title }
+    }
+    const engine = new WorkflowEngine(store, runners)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }, { title: "B" }];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'item', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'use',
+        key: 'use',
+        type: 'ai',
+        order: 3,
+        dependsOn: ['items'],
+        config: { provider: 'openai', model: 'test', messages: [], outputFormat: 'text' }
+      })
+    ]
+    const done = run(engine, store, steps)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(started).toBe(2)
+    release()
+    expect(await done).toBe('completed')
+  })
+
+  it('runs steps listed after a fanout inside each branch', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }, { title: "B" }];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'item', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'shots',
+        key: 'shots',
+        name: 'Формирование шотов',
+        type: 'transform',
+        order: 3,
+        dependsOn: ['concepts'],
+        config: { mode: 'template', template: '{{steps.items.output.title}}' }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('completed')
+    const values = store.executions
+      .filter((item) => item.stepId === 'shots' && item.status === 'completed')
+      .map((item) => store.artifacts.find((artifact) => artifact.stepExecutionId === item.id)?.value)
+    expect(values).toEqual(['A', 'B'])
+    expect(store.executions.some((item) => item.stepId === 'shots' && item.branchId === '')).toBe(false)
+  })
+
+  it('restarts the following steps of one branch when continuing from a finished step', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }, { title: "B" }];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'item', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'note',
+        key: 'note',
+        type: 'transform',
+        order: 3,
+        dependsOn: ['items'],
+        config: { mode: 'template', template: '{{item.title}}' }
+      }),
+      step({
+        id: 'shots',
+        key: 'shots',
+        type: 'transform',
+        order: 4,
+        dependsOn: ['concepts'],
+        config: { mode: 'template', template: '{{steps.note.output}}-shot' }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('completed')
+    const first = store.branches.find((branch) => branch.sourceStepId === 'items' && branch.itemIndex === 0)
+    const second = store.branches.find((branch) => branch.sourceStepId === 'items' && branch.itemIndex === 1)
+    expect(await run(engine, store, steps, { focus: { stepId: 'note', branchId: first?.id ?? '', mode: 'chain' } })).toBe('completed')
+    const done = (stepId: string, branchId: string) =>
+      store.executions.filter((item) => item.stepId === stepId && item.branchId === branchId && item.status === 'completed')
+    expect(done('concepts', '')).toHaveLength(1)
+    expect(done('note', first?.id ?? '')).toHaveLength(2)
+    expect(done('shots', first?.id ?? '')).toHaveLength(2)
+    expect(done('note', second?.id ?? '')).toHaveLength(1)
+    expect(done('shots', second?.id ?? '')).toHaveLength(1)
+    const latest = done('shots', first?.id ?? '').sort((a, b) => a.attempt - b.attempt).at(-1)
+    expect(store.artifacts.find((item) => item.stepExecutionId === latest?.id)?.value).toBe('A-shot')
+  })
+
+  it('does not rerun an earlier manual step when the parse is listed after the fanout', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'answers',
+        key: 'answers',
+        type: 'transform',
+        order: 4,
+        config: { mode: 'template', template: 'ответы' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 5,
+        dependsOn: ['parsed'],
+        iterate: { over: '{{steps.parsed.output}}', alias: 'item', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'parsed',
+        key: 'parsed',
+        type: 'transform',
+        order: 6,
+        dependsOn: ['answers'],
+        config: { mode: 'script', script: 'return [{ title: "A" }, { title: "B" }];' }
+      }),
+      step({
+        id: 'note',
+        key: 'note',
+        type: 'transform',
+        order: 7,
+        dependsOn: ['items'],
+        config: { mode: 'template', template: '{{item.title}}' }
+      }),
+      step({
+        id: 'shots',
+        key: 'shots',
+        type: 'transform',
+        order: 8,
+        dependsOn: [],
+        config: { mode: 'template', template: '{{steps.note.output}}-shot' }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('completed')
+    const first = store.branches.find((branch) => branch.sourceStepId === 'items' && branch.itemIndex === 0)
+    const second = store.branches.find((branch) => branch.sourceStepId === 'items' && branch.itemIndex === 1)
+    expect(await run(engine, store, steps, { focus: { stepId: 'shots', branchId: first?.id ?? '', mode: 'chain' } })).toBe('completed')
+    const done = (stepId: string, branchId: string) =>
+      store.executions.filter((item) => item.stepId === stepId && item.branchId === branchId && item.status === 'completed')
+    expect(done('answers', '')).toHaveLength(1)
+    expect(done('parsed', '')).toHaveLength(1)
+    expect(done('note', first?.id ?? '')).toHaveLength(1)
+    expect(done('shots', first?.id ?? '')).toHaveLength(2)
+    expect(done('note', second?.id ?? '')).toHaveLength(1)
+    expect(done('shots', second?.id ?? '')).toHaveLength(1)
+  })
+
+  it('accepts an empty manual note when the step allows it', () => {
+    const result = applyManualAction(
+      { mode: 'text', prompt: 'Добавьте', allowEmpty: true },
+      { type: 'text', text: '   ' }
+    )
+    expect(result).toEqual({ ok: true, output: '   ' })
   })
 
   it('runs every item and can resume a single manual branch', async () => {
@@ -298,7 +633,134 @@ describe('engine', () => {
     expect(store.artifacts.at(-1)?.value).toBe('дальше-Готовый ответ')
   })
 
-  it('runs a branch created after the source array grows', async () => {
+  it('continues the next step after a manual step is skipped', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({ id: 'draft', key: 'draft', type: 'transform', order: 1, config: { mode: 'template', template: 'Готовый ответ' } }),
+      step({
+        id: 'review',
+        key: 'review',
+        type: 'manual',
+        order: 2,
+        dependsOn: ['draft'],
+        config: { mode: 'text', source: '{{steps.draft.output}}', prompt: 'Можно пропустить', skipStepIds: [] }
+      }),
+      step({
+        id: 'next',
+        key: 'next',
+        type: 'transform',
+        order: 3,
+        dependsOn: ['review'],
+        config: { mode: 'template', template: 'дальше-{{steps.review.output}}' }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('paused')
+    const waiting = store.executions.find((item) => item.status === 'waiting_for_user')
+    const result = await engine.submitUserAction({ runId: 'run', graph: graph(steps), inputs: {} }, waiting!.id, { type: 'skip' })
+    expect(result).toBe('completed')
+    const status = (id: string) => store.executions.filter((item) => item.stepId === id).at(-1)?.status
+    expect(status('review')).toBe('skipped')
+    expect(status('next')).toBe('completed')
+    expect(store.artifacts.at(-1)?.value).toBe('дальше-Готовый ответ')
+  })
+
+  it('continues the branch after a manual step inside it is skipped', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }, { title: "B" }];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'item', launch: 'manual' },
+        config: {}
+      }),
+      step({
+        id: 'review',
+        key: 'review',
+        type: 'manual',
+        order: 3,
+        dependsOn: ['items'],
+        config: { mode: 'text', prompt: 'Добавьте', allowEmpty: true, skipStepIds: [] }
+      }),
+      step({
+        id: 'next',
+        key: 'next',
+        type: 'transform',
+        order: 4,
+        dependsOn: ['review'],
+        config: { mode: 'template', template: '{{steps.items.output.title}}-{{steps.review.output}}' }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('paused')
+    const branch = store.branches.find((item) => item.itemIndex === 0)
+    expect(branch).toBeTruthy()
+    expect(await engine.advance({ runId: 'run', graph: graph(steps), inputs: {}, onlyBranchId: branch!.id })).toBe('paused')
+    const waiting = store.executions.find((item) => item.stepId === 'review' && item.status === 'waiting_for_user')
+    const result = await engine.submitUserAction({ runId: 'run', graph: graph(steps), inputs: {} }, waiting!.id, { type: 'skip' })
+    expect(result).toBe('paused')
+    const next = store.executions.filter((item) => item.stepId === 'next' && item.branchId === branch!.id).at(-1)
+    expect(next?.status).toBe('completed')
+    expect(store.artifacts.find((item) => item.stepExecutionId === next?.id)?.value).toBe('A-')
+  })
+
+  it('runs the following fanout after a manual step is skipped', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'draft',
+        key: 'draft',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }, { title: "B" }];' }
+      }),
+      step({
+        id: 'review',
+        key: 'review',
+        type: 'manual',
+        order: 2,
+        dependsOn: ['draft'],
+        config: { mode: 'confirm', source: '{{steps.draft.output}}', prompt: 'Принять список', skipStepIds: [] }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 3,
+        dependsOn: ['review'],
+        iterate: { over: '{{steps.review.output}}', alias: 'item', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'next',
+        key: 'next',
+        type: 'transform',
+        order: 4,
+        dependsOn: ['items'],
+        config: { mode: 'template', template: '{{steps.items.output.title}}' }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('paused')
+    const waiting = store.executions.find((item) => item.status === 'waiting_for_user')
+    expect(await engine.submitUserAction({ runId: 'run', graph: graph(steps), inputs: {} }, waiting!.id, { type: 'skip' })).toBe('completed')
+    const values = store.executions
+      .filter((item) => item.stepId === 'next' && item.status === 'completed')
+      .map((item) => store.artifacts.find((artifact) => artifact.stepExecutionId === item.id)?.value)
+    expect(values).toEqual(['A', 'B'])
+  })
+
+  it('keeps finished items and appends a new batch when the array length changes', async () => {
     const store = new MemoryStore()
     const engine = new WorkflowEngine(store)
     let shots = [{ title: 'A' }, { title: 'B' }]
@@ -335,22 +797,219 @@ describe('engine', () => {
     shots = [{ title: 'A2' }, { title: 'B2' }, { title: 'C' }]
     expect(await run(custom, store, steps, { focus: { stepId: 'parsed', branchId: '', mode: 'chain' } })).toBe('paused')
     const created = store.branches.filter((branch) => branch.sourceStepId === 'draft')
-    expect(created).toHaveLength(3)
-    const reused = created.find((branch) => branch.id === first?.id)
-    const fresh = created.find((branch) => branch.itemIndex === 2)
-    expect(reused?.status).toBe('pending')
-    expect(reused?.label).toBe('A2')
-    expect(fresh?.status).toBe('pending')
+    expect(created).toHaveLength(5)
+    const kept = created.find((branch) => branch.id === first?.id)
+    const untouched = created.find((branch) => branch.itemIndex === 1)
+    const added = created.filter((branch) => branch.batch === 1).sort((a, b) => a.itemIndex - b.itemIndex)
+    expect(kept?.status).toBe('completed')
+    expect(kept?.label).toBe('A')
+    expect(kept?.batch).toBe(0)
+    expect(untouched?.status).toBe('pending')
+    expect(untouched?.label).toBe('B')
+    expect(added.map((branch) => branch.label)).toEqual(['A2', 'B2', 'C'])
+    expect(added.map((branch) => branch.itemIndex)).toEqual([2, 3, 4])
+    expect(added.every((branch) => branch.status === 'pending')).toBe(true)
 
-    expect(await run(custom, store, steps, { onlyBranchId: reused?.id })).toBe('paused')
-    const reusedExecutions = store.executions.filter((item) => item.stepId === 'draft' && item.branchId === reused?.id && item.status === 'completed')
-    expect(reusedExecutions).toHaveLength(2)
-    expect(store.artifacts.find((item) => item.stepExecutionId === reusedExecutions.at(-1)?.id)?.value).toBe('A2')
+    expect(await run(custom, store, steps, { onlyBranchId: added[0]?.id })).toBe('paused')
+    const keptExecutions = store.executions.filter((item) => item.stepId === 'draft' && item.branchId === kept?.id && item.status === 'completed')
+    expect(keptExecutions).toHaveLength(1)
+    expect(store.artifacts.find((item) => item.stepExecutionId === keptExecutions[0]?.id)?.value).toBe('A')
+    const execution = store.executions.find((item) => item.stepId === 'draft' && item.branchId === added[0]?.id && item.status === 'completed')
+    expect(store.artifacts.find((item) => item.stepExecutionId === execution?.id)?.value).toBe('A2')
+  })
 
-    expect(await run(custom, store, steps, { onlyBranchId: fresh?.id })).toBe('paused')
-    const execution = store.executions.find((item) => item.stepId === 'draft' && item.branchId === fresh?.id && item.status === 'completed')
-    expect(execution).toBeTruthy()
-    expect(store.artifacts.find((item) => item.stepExecutionId === execution?.id)?.value).toBe('C')
+  it('refreshes branches in place when the new array has the same length', async () => {
+    const store = new MemoryStore()
+    let shots = [{ title: 'A' }, { title: 'B' }]
+    const steps = [
+      step({
+        id: 'parsed',
+        key: 'parsed',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return shots' }
+      }),
+      step({
+        id: 'draft',
+        key: 'draft',
+        type: 'transform',
+        order: 2,
+        dependsOn: ['parsed'],
+        iterate: { over: '{{steps.parsed.output}}', alias: 'item', launch: 'manual' },
+        config: { mode: 'template', template: '{{item.title}}' }
+      })
+    ]
+    const runners = createRunners()
+    const base = runners.transform
+    runners.transform = async (context) => {
+      if (context.step.id === 'parsed') return { status: 'completed', output: shots, rawResponse: null }
+      return base(context)
+    }
+    const custom = new WorkflowEngine(store, runners)
+    expect(await run(custom, store, steps)).toBe('paused')
+    const first = store.branches.find((branch) => branch.itemIndex === 0)
+    shots = [{ title: 'A2' }, { title: 'B2' }]
+    expect(await run(custom, store, steps, { focus: { stepId: 'parsed', branchId: '', mode: 'chain' } })).toBe('paused')
+    const created = store.branches.filter((branch) => branch.sourceStepId === 'draft')
+    expect(created).toHaveLength(2)
+    expect(created.find((branch) => branch.id === first?.id)?.label).toBe('A2')
+    expect(created.every((branch) => branch.status === 'pending' && branch.batch === 0)).toBe(true)
+  })
+
+  it('appends a new row when the same count is generated with the new-row flag', async () => {
+    const store = new MemoryStore()
+    let shots = [{ title: 'A' }, { title: 'B' }]
+    const steps = [
+      step({
+        id: 'parsed',
+        key: 'parsed',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return shots' }
+      }),
+      step({
+        id: 'draft',
+        key: 'draft',
+        type: 'transform',
+        order: 2,
+        dependsOn: ['parsed'],
+        iterate: { over: '{{steps.parsed.output}}', alias: 'item', launch: 'manual' },
+        config: { mode: 'template', template: '{{item.title}}' }
+      })
+    ]
+    const runners = createRunners()
+    const base = runners.transform
+    runners.transform = async (context) => {
+      if (context.step.id === 'parsed') return { status: 'completed', output: shots, rawResponse: null }
+      return base(context)
+    }
+    const custom = new WorkflowEngine(store, runners)
+    expect(await run(custom, store, steps)).toBe('paused')
+    const first = store.branches.find((branch) => branch.itemIndex === 0)
+    shots = [{ title: 'A2' }, { title: 'B2' }]
+    expect(
+      await run(custom, store, steps, { focus: { stepId: 'parsed', branchId: '', mode: 'chain' }, appendBatch: true })
+    ).toBe('paused')
+    const created = store.branches.filter((branch) => branch.sourceStepId === 'draft')
+    expect(created).toHaveLength(4)
+    expect(created.find((branch) => branch.id === first?.id)?.label).toBe('A')
+    expect(created.find((branch) => branch.id === first?.id)?.status).toBe('pending')
+    const added = created.filter((branch) => branch.batch === 1).sort((a, b) => a.itemIndex - b.itemIndex)
+    expect(added.map((branch) => branch.label)).toEqual(['A2', 'B2'])
+    expect(added.every((branch) => branch.status === 'pending')).toBe(true)
+  })
+
+  it('runs request steps of a nested all-at-once fanout together', async () => {
+    const store = new MemoryStore()
+    let started = 0
+    let release: () => void = () => undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const runners = createRunners()
+    runners.ai = async () => {
+      started += 1
+      await gate
+      return { status: 'completed', output: 'ok', rawResponse: 'ok' }
+    }
+    const engine = new WorkflowEngine(store, runners)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }];' }
+      }),
+      step({
+        id: 'concept',
+        key: 'concept',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'concept', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'shots',
+        key: 'shots',
+        type: 'transform',
+        order: 3,
+        dependsOn: ['concept'],
+        config: { mode: 'script', script: 'return [{ title: "S1" }, { title: "S2" }];' }
+      }),
+      step({
+        id: 'shot',
+        key: 'shot',
+        type: 'fanout',
+        order: 4,
+        dependsOn: ['shots'],
+        iterate: { over: '{{steps.shots.output}}', alias: 'item', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'ask',
+        key: 'ask',
+        type: 'ai',
+        order: 5,
+        dependsOn: ['shot'],
+        config: { provider: 'openai', model: 'test', messages: [], outputFormat: 'text' }
+      })
+    ]
+    const done = run(engine, store, steps)
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    expect(started).toBe(2)
+    release()
+    expect(await done).toBe('completed')
+  })
+
+  it('keeps the branch after the run is stopped and continues the interrupted step', async () => {
+    const store = new MemoryStore()
+    const controller = new AbortController()
+    let calls = 0
+    const runners = createRunners()
+    runners.ai = async () => {
+      calls += 1
+      if (calls === 1) {
+        controller.abort()
+        throw new Error('The operation was aborted')
+      }
+      return { status: 'completed', output: 'ok', rawResponse: 'ok' }
+    }
+    const engine = new WorkflowEngine(store, runners)
+    const steps = [
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }, { title: "B" }];' }
+      }),
+      step({
+        id: 'fan',
+        key: 'fan',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['items'],
+        iterate: { over: '{{steps.items.output}}', alias: 'item', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'ask',
+        key: 'ask',
+        type: 'ai',
+        order: 3,
+        dependsOn: ['fan'],
+        config: { provider: 'openai', model: 'test', messages: [], outputFormat: 'text' }
+      })
+    ]
+    expect(await engine.advance({ runId: 'run', graph: graph(steps), inputs: {}, signal: controller.signal })).toBe('paused')
+    const branches = store.branches.filter((branch) => branch.sourceStepId === 'fan')
+    expect(branches).toHaveLength(2)
+    expect(branches.some((branch) => branch.status === 'cancelled')).toBe(false)
+    expect(store.executions.some((item) => item.stepId === 'ask' && item.meta.interrupted)).toBe(true)
+    expect(await run(engine, store, steps)).toBe('completed')
+    expect(calls).toBe(3)
   })
 
   it('fans out a second level inside each outer branch', async () => {

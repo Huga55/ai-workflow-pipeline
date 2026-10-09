@@ -1,5 +1,6 @@
+import { topoSort } from '@core/graph'
 import { isStoredFile } from '@core/media'
-import type { ContentPart, VariableContext, WorkflowGraph, StepDefinition } from '@core/types'
+import type { ContentPart, NamedVariable, VariableContext, VariableVersion, WorkflowGraph, StepDefinition } from '@core/types'
 
 export type PathSegment = { kind: 'prop'; name: string } | { kind: 'index'; index: number }
 
@@ -58,7 +59,13 @@ export function resolvePath(path: string, ctx: VariableContext): ResolveResult {
   else if (root === 'project') value = ctx.project ?? {}
   else if (root === 'current_item') value = ctx.current_item
   else if (root === 'current_index') value = ctx.current_index
-  else if (Object.prototype.hasOwnProperty.call(ctx.aliases, root)) {
+  else if (root === 'prev') {
+    if (!ctx.prev) return { ok: false, error: 'У этого шага нет предыдущего' }
+    if (ctx.prev.output === undefined) return { ok: false, error: 'Предыдущий шаг ещё без результата' }
+    let rest = segments.slice(1)
+    if (rest[0]?.kind === 'prop' && rest[0].name === 'output') rest = rest.slice(1)
+    return walk(ctx.prev.output, rest, path)
+  } else if (Object.prototype.hasOwnProperty.call(ctx.aliases, root)) {
     value = ctx.aliases[root]
     return walk(value, segments.slice(1), path)
   } else {
@@ -156,11 +163,33 @@ export function stringifyValue(value: unknown): string {
   return JSON.stringify(value, null, 2)
 }
 
+export function latestVariableVersion(variable: NamedVariable): VariableVersion | undefined {
+  const versions = variable.versions ?? []
+  return versions.reduce<VariableVersion | undefined>(
+    (best, item) => (!best || item.version > best.version ? item : best),
+    undefined
+  )
+}
+
+export function previousStep(step: StepDefinition, steps: StepDefinition[]): StepDefinition | null {
+  const byId = new Map(steps.map((item) => [item.id, item]))
+  const deps = step.dependsOn
+    .map((id) => byId.get(id))
+    .filter((item): item is StepDefinition => Boolean(item))
+  if (!deps.length) return null
+  if (deps.length === 1) return deps[0]
+  const sorted = topoSort(steps)
+  const order = sorted.ok ? sorted.steps : [...steps].sort((a, b) => a.order - b.order)
+  return deps.reduce((best, item) =>
+    order.findIndex((candidate) => candidate.id === item.id) > order.findIndex((candidate) => candidate.id === best.id) ? item : best
+  )
+}
+
 export type CatalogItem = { path: string; label: string; hint?: string }
 export type CatalogGroup = { title: string; items: CatalogItem[] }
 export type VariablePools = {
-  globals?: { name: string; label: string }[]
-  project?: { name: string; label: string }[]
+  globals?: { name: string; label: string; version?: number }[]
+  project?: { name: string; label: string; version?: number }[]
 }
 
 export function variableCatalog(graph: WorkflowGraph, step?: StepDefinition, pools?: VariablePools): CatalogGroup[] {
@@ -173,19 +202,34 @@ export function variableCatalog(graph: WorkflowGraph, step?: StepDefinition, poo
       hint: input.name
     }))
   })
-  const named = (title: string, root: 'globals' | 'project', items: { name: string; label: string }[] | undefined) => {
+  const named = (title: string, root: 'globals' | 'project', items: { name: string; label: string; version?: number }[] | undefined) => {
     if (!items?.length) return
     groups.push({
       title,
       items: items.map((item) => ({
         path: `${root}.${item.name}`,
         label: item.label || item.name,
-        hint: item.name
+        hint: item.version ? `v${item.version}` : item.name
       }))
     })
   }
   named('Проект', 'project', pools?.project)
   named('Глобальные', 'globals', pools?.globals)
+
+  if (step) {
+    const prev = previousStep(step, graph.steps)
+    if (prev) {
+      const items: CatalogItem[] = [
+        { path: 'prev.output', label: 'Выход предыдущего шага', hint: prev.name }
+      ]
+      if (prev.type === 'ai' && prev.config.outputFormat === 'json') {
+        for (const prop of schemaProperties(prev.config.jsonSchema)) {
+          items.push({ path: `prev.output.${prop}`, label: `${prev.name} → ${prop}`, hint: prop })
+        }
+      }
+      groups.push({ title: 'Предыдущий', items })
+    }
+  }
 
   const stepItems: CatalogItem[] = []
   for (const candidate of graph.steps) {
@@ -216,8 +260,10 @@ export function variableCatalog(graph: WorkflowGraph, step?: StepDefinition, poo
   if (step) {
     for (const ancestor of upstreamSteps(step, graph.steps)) {
       if (ancestor.iterate?.alias) aliases.add(ancestor.iterate.alias)
+      if (ancestor.iterate?.noteAlias) aliases.add(ancestor.iterate.noteAlias)
     }
     if (step.iterate?.alias) aliases.add(step.iterate.alias)
+    if (step.iterate?.noteAlias) aliases.add(step.iterate.noteAlias)
   }
   for (const alias of aliases) {
     if (alias === 'current_item' || alias === 'current_index') continue

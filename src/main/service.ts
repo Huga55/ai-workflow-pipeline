@@ -3,10 +3,12 @@ import path from 'node:path'
 import { attachPaths, BUNDLE_FORMAT, BUNDLE_VERSION, detachPaths, parseBundle, type Bundle } from '@core/bundle'
 import { createId, nowIso } from '@core/ids'
 import { normalizeInputs, validateInputs } from '@core/inputs'
+import { runVersionFit } from '@core/run-version'
 import { stableStringify } from '@core/json'
 import { formatRunNumber } from '@core/labels'
 import { validateGraph } from '@core/graph'
-import { settleRunStatus, WorkflowEngine } from '@core/engine'
+import { isAbortError, settleRunStatus, WorkflowEngine } from '@core/engine'
+import { latestVariableVersion } from '@core/variables'
 import { createRunners } from '@core/runners'
 import { createNeurophotoGraph } from '@core/template'
 import type { AIRequest, AIResponse, NamedVariable, Project, ProviderStatus, RunDetails, StoredFile, UserActionPayload, WorkflowDetails, WorkflowDraft, WorkflowGraph } from '@core/types'
@@ -29,6 +31,7 @@ const MIME: Record<string, string> = {
 export class AppService {
   private engine: WorkflowEngine
   private active = new Map<string, AbortController>()
+  private inflight = new Map<string, Promise<RunDetails>>()
 
   constructor(
     private database: AppDatabase,
@@ -71,7 +74,10 @@ export class AppService {
       })),
       artifacts: snapshot.artifacts.map((artifact) => ({ ...artifact, value: detach(artifact.value) })),
       actions: snapshot.actions.map((action) => ({ ...action, payload: detach(action.payload) })),
-      variables: snapshot.variables.map((variable) => ({ ...variable, value: detach(variable.value) })),
+      variables: snapshot.variables.map((variable) => ({
+        ...variable,
+        versions: variable.versions.map((version) => ({ ...version, value: detach(version.value) }))
+      })),
       secrets: this.secrets.entries(),
       media: []
     }
@@ -115,7 +121,10 @@ export class AppService {
       })),
       artifacts: bundle.artifacts.map((artifact) => ({ ...artifact, value: attach(artifact.value) })),
       actions: bundle.actions.map((action) => ({ ...action, payload: attach(action.payload) })),
-      variables: bundle.variables.map((variable) => ({ ...variable, value: attach(variable.value) }))
+      variables: bundle.variables.map((variable) => ({
+        ...variable,
+        versions: variable.versions.map((version) => ({ ...version, value: attach(version.value) }))
+      }))
     })
     for (const [providerId, apiKey] of Object.entries(bundle.secrets)) {
       if (apiKey.trim()) this.secrets.set(providerId, apiKey)
@@ -285,6 +294,7 @@ export class AppService {
   }
 
   getRun(runId: string): RunDetails {
+    if (!this.active.has(runId)) this.restoreStopped(runId)
     return this.database.getRun(runId)
   }
 
@@ -300,32 +310,125 @@ export class AppService {
     return this.database.getRun(runId)
   }
 
+  setRunVersion(runId: string, versionNumber: number): RunDetails {
+    if (this.active.has(runId)) throw new Error('Этот запуск сейчас выполняется. Сначала остановите его.')
+    const details = this.database.getRun(runId)
+    const version = this.database.getVersionByNumber(details.run.workflowId, versionNumber)
+    if (version.id === details.run.workflowVersionId) return details
+    const fit = runVersionFit(details.graph, version.graph, details)
+    if (!fit.ok) throw new Error(fit.reasons.join('\n'))
+    this.database.updateRunWorkflowVersion(runId, version.id, normalizeInputs(version.graph, details.run.inputs), nowIso())
+    return this.database.getRun(runId)
+  }
+
   listVariables(scope: 'global' | 'project', projectId?: string): NamedVariable[] {
     return this.database.listVariables(scope, scope === 'project' ? projectId || null : null)
   }
 
-  saveVariable(input: { scope: 'global' | 'project'; projectId?: string; name: string; label: string; value: unknown }): NamedVariable {
-    const name = input.name.trim()
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
-      throw new Error('Имя переменной: латиница, цифры и _, начинается с буквы')
+  saveVariable(input: {
+    scope: 'global' | 'project'
+    projectId?: string
+    name: string
+    label: string
+    value: unknown
+    description?: string
+  }): NamedVariable {
+    const name = this.variableName(input.name)
+    const projectId = this.variableProject(input.scope, input.projectId)
+    if (this.database.listVariables(input.scope, projectId).some((item) => item.name === name)) {
+      throw new Error('Переменная с таким именем уже есть')
     }
-    const projectId = input.scope === 'project' ? input.projectId || null : null
-    if (input.scope === 'project' && !projectId) throw new Error('Не указан проект')
+    const timestamp = nowIso()
     const variable: NamedVariable = {
       id: createId(),
       scope: input.scope,
       projectId,
       name,
       label: input.label.trim() || name,
-      value: input.value,
-      updatedAt: nowIso()
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      versions: [
+        {
+          id: createId(),
+          version: 1,
+          description: input.description?.trim() ?? '',
+          value: input.value,
+          createdAt: timestamp
+        }
+      ]
     }
-    this.database.saveVariable(variable)
-    return this.database.listVariables(input.scope, projectId).find((item) => item.name === name) ?? variable
+    this.database.insertVariable(variable)
+    return this.database.getVariable(variable.id)
+  }
+
+  updateVariable(input: { id: string; name: string; label: string }): NamedVariable {
+    const current = this.database.getVariable(input.id)
+    const name = this.variableName(input.name)
+    const taken = this.database
+      .listVariables(current.scope, current.projectId)
+      .some((item) => item.name === name && item.id !== current.id)
+    if (taken) throw new Error('Переменная с таким именем уже есть')
+    this.database.updateVariable(current.id, { name, label: input.label.trim() || name }, nowIso())
+    return this.database.getVariable(current.id)
+  }
+
+  addVariableVersion(input: { id: string; value: unknown; description?: string }): NamedVariable {
+    const current = this.database.getVariable(input.id)
+    const latest = latestVariableVersion(current)
+    const timestamp = nowIso()
+    this.database.insertVariableVersion(
+      current.id,
+      {
+        id: createId(),
+        version: (latest?.version ?? 0) + 1,
+        description: input.description?.trim() ?? '',
+        value: input.value,
+        createdAt: timestamp
+      },
+      timestamp
+    )
+    return this.database.getVariable(current.id)
+  }
+
+  updateVariableVersion(input: { id: string; description: string }): NamedVariable {
+    const owner = this.findVariableByVersion(input.id)
+    this.database.updateVersionDescription(input.id, input.description.trim(), nowIso())
+    return this.database.getVariable(owner.id)
+  }
+
+  deleteVariableVersion(id: string): NamedVariable {
+    const owner = this.findVariableByVersion(id)
+    this.database.deleteVariableVersion(id, nowIso())
+    return this.database.getVariable(owner.id)
   }
 
   deleteVariable(id: string): void {
     this.database.deleteVariable(id)
+  }
+
+  private variableName(name: string): string {
+    const trimmed = name.trim()
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) {
+      throw new Error('Имя переменной: латиница, цифры и _, начинается с буквы')
+    }
+    return trimmed
+  }
+
+  private variableProject(scope: 'global' | 'project', projectId?: string): string | null {
+    const id = scope === 'project' ? projectId || null : null
+    if (scope === 'project' && !id) throw new Error('Не указан проект')
+    return id
+  }
+
+  private findVariableByVersion(versionId: string): NamedVariable {
+    const scopes: Array<['global' | 'project', string | null]> = [['global', null]]
+    const projects = this.database.listProjects()
+    for (const project of projects) scopes.push(['project', project.id])
+    for (const [scope, projectId] of scopes) {
+      const found = this.database.listVariables(scope, projectId).find((item) => item.versions.some((version) => version.id === versionId))
+      if (found) return found
+    }
+    throw new Error('Версия не найдена')
   }
 
   async startRun(runId: string, options?: { untilStepId?: string }): Promise<RunDetails> {
@@ -337,7 +440,7 @@ export class AppService {
 
   async continueRun(
     runId: string,
-    options?: { branchId?: string; untilStepId?: string; startManualBranches?: boolean }
+    options?: { branchId?: string; untilStepId?: string; startManualBranches?: boolean; note?: string }
   ): Promise<RunDetails> {
     this.guardRunnable(runId)
     return this.advance(runId, options ?? {})
@@ -348,9 +451,15 @@ export class AppService {
     return this.advance(runId, { retry: { stepId, branchId } })
   }
 
-  async runStep(runId: string, stepId: string, branchId: string, mode: 'only' | 'chain'): Promise<RunDetails> {
+  async runStep(
+    runId: string,
+    stepId: string,
+    branchId: string,
+    mode: 'only' | 'chain',
+    options?: { appendBatch?: boolean }
+  ): Promise<RunDetails> {
     this.guardRunnable(runId)
-    return this.advance(runId, { focus: { stepId, branchId, mode } })
+    return this.advance(runId, { focus: { stepId, branchId, mode }, appendBatch: options?.appendBatch })
   }
 
   async skipStep(runId: string, stepId: string, branchId: string): Promise<RunDetails> {
@@ -370,12 +479,21 @@ export class AppService {
 
   async cancelRun(runId: string): Promise<RunDetails> {
     const controller = this.active.get(runId)
-    if (controller) {
+    const pending = this.inflight.get(runId)
+    if (controller && pending) {
       controller.abort()
-      return this.database.getRun(runId)
+      try {
+        await pending
+      } catch {
+        // Статус уже записан в withLock.
+      }
+      return this.getRun(runId)
     }
-    this.database.updateRunStatus(runId, 'cancelled', null, nowIso())
-    return this.database.getRun(runId)
+    const details = this.database.getRun(runId)
+    if (details.run.status === 'running' || details.run.status === 'cancelled') {
+      this.database.updateRunStatus(runId, 'paused', null, nowIso())
+    }
+    return this.getRun(runId)
   }
 
   storePickedFiles(filePaths: string[], kind: 'image' | 'file'): StoredFile[] {
@@ -424,6 +542,7 @@ export class AppService {
 
   private guardRunnable(runId: string): RunDetails {
     if (this.active.has(runId)) throw new Error('Этот запуск уже выполняется')
+    this.restoreStopped(runId)
     const details = this.database.getRun(runId)
     const errors = validateGraph(details.graph)
     if (errors.length) throw new Error(errors.join('\n'))
@@ -437,8 +556,10 @@ export class AppService {
       untilStepId?: string
       branchId?: string
       startManualBranches?: boolean
+      note?: string
       retry?: { stepId: string; branchId: string }
       focus?: { stepId: string; branchId: string; mode: 'only' | 'chain' }
+      appendBatch?: boolean
     }
   ): Promise<RunDetails> {
     return this.withLock(runId, (signal) =>
@@ -447,27 +568,41 @@ export class AppService {
         untilStepId: options.untilStepId,
         onlyBranchId: options.branchId,
         startManualBranches: options.startManualBranches,
+        branchNote: options.note,
         retry: options.retry,
-        focus: options.focus
+        focus: options.focus,
+        appendBatch: options.appendBatch
       })
     )
   }
 
-  private async withLock(runId: string, work: (signal: AbortSignal) => Promise<'completed' | 'paused' | 'failed' | 'cancelled'>): Promise<RunDetails> {
+  private withLock(runId: string, work: (signal: AbortSignal) => Promise<'completed' | 'paused' | 'failed' | 'cancelled'>): Promise<RunDetails> {
     const controller = new AbortController()
     this.active.set(runId, controller)
+    const task = this.runLocked(runId, controller, work)
+    this.inflight.set(runId, task)
+    return task.finally(() => {
+      this.inflight.delete(runId)
+    })
+  }
+
+  private async runLocked(
+    runId: string,
+    controller: AbortController,
+    work: (signal: AbortSignal) => Promise<'completed' | 'paused' | 'failed' | 'cancelled'>
+  ): Promise<RunDetails> {
     this.database.updateRunStatus(runId, 'running', null, nowIso())
     this.onRunUpdated(runId)
     try {
       const result = await work(controller.signal)
       const details = this.database.getRun(runId)
-      const status = controller.signal.aborted ? 'cancelled' : settleRunStatus(result, new SqliteEngineStore(this.database), runId, details.graph)
+      const status = controller.signal.aborted ? 'paused' : settleRunStatus(result, new SqliteEngineStore(this.database), runId, details.graph)
       const error = status === 'failed' ? this.latestError(details) : null
       this.database.updateRunStatus(runId, status, error, nowIso())
       return this.database.getRun(runId)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Ошибка выполнения'
-      if (controller.signal.aborted) this.database.updateRunStatus(runId, 'cancelled', null, nowIso())
+      if (controller.signal.aborted) this.database.updateRunStatus(runId, 'paused', null, nowIso())
       else this.database.updateRunStatus(runId, 'failed', message, nowIso())
       throw error
     } finally {
@@ -491,8 +626,37 @@ export class AppService {
 
   private variableMap(scope: 'global' | 'project', projectId: string | null): Record<string, unknown> {
     const values: Record<string, unknown> = {}
-    for (const item of this.database.listVariables(scope, projectId)) values[item.name] = item.value
+    for (const item of this.database.listVariables(scope, projectId)) {
+      const current = latestVariableVersion(item)
+      if (current) values[item.name] = current.value
+    }
     return values
+  }
+
+  private restoreStopped(runId: string): void {
+    const details = this.database.getRun(runId)
+    const needsRun = details.run.status === 'cancelled'
+    const needsBranch = details.branches.some((branch) => branch.status === 'cancelled')
+    const needsExecution = details.executions.some(
+      (execution) => execution.status === 'running' || (isAbortError(execution.error) && !execution.meta.interrupted)
+    )
+    if (!needsRun && !needsBranch && !needsExecution) return
+    const rejected = this.database.confirmRejectedBranchIds(runId)
+    if (details.run.status === 'cancelled') this.database.updateRunStatus(runId, 'paused', null, nowIso())
+    for (const branch of details.branches) {
+      if (branch.status !== 'cancelled' || rejected.has(branch.id)) continue
+      branch.status = 'paused'
+      this.database.updateBranch(branch)
+    }
+    for (const execution of details.executions) {
+      const aborted = execution.status === 'running' || isAbortError(execution.error)
+      if (!aborted || execution.meta.interrupted) continue
+      execution.status = 'failed'
+      execution.error = 'Остановлено'
+      execution.meta = { ...execution.meta, interrupted: true }
+      execution.finishedAt = execution.finishedAt ?? nowIso()
+      this.database.updateExecution(execution)
+    }
   }
 
   private latestError(details: RunDetails): string | null {

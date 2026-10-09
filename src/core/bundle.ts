@@ -7,6 +7,7 @@ import type {
   Run,
   StepExecution,
   UserAction,
+  VariableVersion,
   Workflow,
   WorkflowGraph,
   WorkflowVersion
@@ -75,7 +76,52 @@ export function parseBundle(text: string): Bundle {
   }
   if (!data.secrets || typeof data.secrets !== 'object' || Array.isArray(data.secrets)) data.secrets = {}
   if (!Array.isArray(data.media)) data.media = []
+  data.variables = data.variables.map((item) => normalizeImportedVariable(item))
   return data
+}
+
+export function normalizeImportedVariable(raw: unknown): NamedVariable {
+  if (!raw || typeof raw !== 'object') throw new Error('Файл экспорта повреждён')
+  const row = raw as Record<string, unknown>
+  const id = typeof row.id === 'string' ? row.id : ''
+  const name = typeof row.name === 'string' ? row.name : ''
+  if (!id || !name) throw new Error('Файл экспорта повреждён')
+  const updatedAt = typeof row.updatedAt === 'string' ? row.updatedAt : new Date(0).toISOString()
+  const versions = Array.isArray(row.versions)
+    ? row.versions.map((item, index) => normalizeImportedVersion(item, id, index, updatedAt))
+    : [
+        {
+          id: `${id}-v1`,
+          version: 1,
+          description: '',
+          value: row.value,
+          createdAt: updatedAt
+        }
+      ]
+  if (!versions.length) throw new Error('Файл экспорта повреждён')
+  return {
+    id,
+    scope: row.scope === 'project' ? 'project' : 'global',
+    projectId: typeof row.projectId === 'string' && row.projectId ? row.projectId : null,
+    name,
+    label: typeof row.label === 'string' && row.label ? row.label : name,
+    createdAt: typeof row.createdAt === 'string' ? row.createdAt : updatedAt,
+    updatedAt,
+    versions
+  }
+}
+
+function normalizeImportedVersion(raw: unknown, variableId: string, index: number, fallbackAt: string): VariableVersion {
+  if (!raw || typeof raw !== 'object') throw new Error('Файл экспорта повреждён')
+  const row = raw as Record<string, unknown>
+  const version = typeof row.version === 'number' && Number.isInteger(row.version) && row.version > 0 ? row.version : index + 1
+  return {
+    id: typeof row.id === 'string' && row.id ? row.id : `${variableId}-v${version}`,
+    version,
+    description: typeof row.description === 'string' ? row.description : '',
+    value: row.value,
+    createdAt: typeof row.createdAt === 'string' ? row.createdAt : fallbackAt
+  }
 }
 
 export type StoredPath = { path: string; name: string; mime: string }

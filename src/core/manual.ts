@@ -19,7 +19,7 @@ export function applyManualAction(
   }
   if (payload.type === 'text') {
     if (waiting.mode !== 'text') return { ok: false, error: 'Этот шаг не ожидает текст' }
-    if (!payload.text.trim()) return { ok: false, error: 'Введите текст' }
+    if (!payload.text.trim() && !waiting.allowEmpty) return { ok: false, error: 'Введите текст' }
     return { ok: true, output: payload.text }
   }
   if (payload.type === 'confirm') {

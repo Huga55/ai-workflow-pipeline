@@ -47,15 +47,18 @@ export function registerIpc(service: AppService, getWindow: () => BrowserWindow 
   ipcMain.handle('getRun', (_event, runId: string) => service.getRun(runId))
   ipcMain.handle('updateRunInputs', (_event, runId: string, inputs: Record<string, unknown>) => service.updateRunInputs(runId, inputs))
   ipcMain.handle('updateRunTitle', (_event, runId: string, title: string) => service.updateRunTitle(runId, title))
+  ipcMain.handle('setRunVersion', (_event, runId: string, versionNumber: number) => service.setRunVersion(runId, versionNumber))
   ipcMain.handle('startRun', (_event, runId: string, options?: { untilStepId?: string }) => service.startRun(runId, options))
   ipcMain.handle(
     'continueRun',
-    (_event, runId: string, options?: { branchId?: string; untilStepId?: string; startManualBranches?: boolean }) =>
+    (_event, runId: string, options?: { branchId?: string; untilStepId?: string; startManualBranches?: boolean; note?: string }) =>
       service.continueRun(runId, options)
   )
   ipcMain.handle('retryStep', (_event, runId: string, stepId: string, branchId: string) => service.retryStep(runId, stepId, branchId))
-  ipcMain.handle('runStep', (_event, runId: string, stepId: string, branchId: string, mode: 'only' | 'chain') =>
-    service.runStep(runId, stepId, branchId, mode)
+  ipcMain.handle(
+    'runStep',
+    (_event, runId: string, stepId: string, branchId: string, mode: 'only' | 'chain', options?: { appendBatch?: boolean }) =>
+      service.runStep(runId, stepId, branchId, mode, options)
   )
   ipcMain.handle('skipStep', (_event, runId: string, stepId: string, branchId: string) => service.skipStep(runId, stepId, branchId))
   ipcMain.handle('listVariables', (_event, scope: 'global' | 'project', projectId?: string) => service.listVariables(scope, projectId))
@@ -63,9 +66,16 @@ export function registerIpc(service: AppService, getWindow: () => BrowserWindow 
     'saveVariable',
     (
       _event,
-      input: { scope: 'global' | 'project'; projectId?: string; name: string; label: string; value: unknown }
+      input: { scope: 'global' | 'project'; projectId?: string; name: string; label: string; value: unknown; description?: string }
     ) => service.saveVariable(input)
   )
+  ipcMain.handle('updateVariable', (_event, input: { id: string; name: string; label: string }) => service.updateVariable(input))
+  ipcMain.handle(
+    'addVariableVersion',
+    (_event, input: { id: string; value: unknown; description?: string }) => service.addVariableVersion(input)
+  )
+  ipcMain.handle('updateVariableVersion', (_event, input: { id: string; description: string }) => service.updateVariableVersion(input))
+  ipcMain.handle('deleteVariableVersion', (_event, id: string) => service.deleteVariableVersion(id))
   ipcMain.handle('deleteVariable', (_event, id: string) => service.deleteVariable(id))
   ipcMain.handle('submitUserAction', (_event, runId: string, executionId: string, payload: UserActionPayload) =>
     service.submitUserAction(runId, executionId, payload)

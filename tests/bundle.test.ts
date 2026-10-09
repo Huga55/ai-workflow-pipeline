@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { attachPaths, detachPaths, parseBundle } from '@core/bundle'
+import { attachPaths, detachPaths, normalizeImportedVariable, parseBundle } from '@core/bundle'
 
 function expect(actual: unknown) {
   return {
@@ -30,6 +30,22 @@ describe('bundle', () => {
     const restored = attachPaths(detached, new Map([[id, 'D:/new/a.png']])) as typeof detached
     expect(restored.inputs.photo.path).toBe('D:/new/a.png')
     expect(restored.request[0].path).toBe('D:/new/a.png')
+  })
+
+  it('wraps an old variable without versions into version 1', () => {
+    const variable = normalizeImportedVariable({
+      id: 'var',
+      scope: 'global',
+      projectId: null,
+      name: 'brand',
+      label: 'Бренд',
+      value: 'MELOA',
+      updatedAt: '2026-10-05T00:00:00.000Z'
+    })
+    expect(variable.versions.length).toBe(1)
+    expect(variable.versions[0]?.version).toBe(1)
+    expect(variable.versions[0]?.value).toBe('MELOA')
+    expect(variable.name).toBe('brand')
   })
 
   it('rejects a file that is not a pipeline export', () => {

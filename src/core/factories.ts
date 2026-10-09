@@ -54,6 +54,8 @@ export function createStep(type: StepType, graph: WorkflowGraph, name?: string):
       return { ...base, type, config: { mode: 'template', template: '' } }
     case 'parse':
       return { ...base, type, config: { source: '', mode: 'json' } }
+    case 'fanout':
+      return { ...base, type, iterate: { over: '', alias: 'item', launch: 'manual' }, config: {} }
     case 'manual':
       return {
         ...base,
@@ -75,6 +77,8 @@ function defaultStepName(type: StepType): string {
       return 'Преобразование'
     case 'parse':
       return 'Разбор'
+    case 'fanout':
+      return 'Элементы'
     case 'manual':
       return 'Ручной шаг'
     case 'merge':
