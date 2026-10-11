@@ -605,17 +605,25 @@ function RunActions({
   const canSkip = !latest || (latest.status !== 'completed' && latest.status !== 'skipped' && latest.status !== 'running' && latest.status !== 'waiting_for_user')
   const chain = chainStepIds(step.id, details.graph.steps)
   const canAppend = details.graph.steps.some((item) => item.iterate && chain.has(item.id))
+  const forcedAppend = details.graph.steps.some((item) => item.iterate?.appendOnRerun && chain.has(item.id))
   const runAgain = (mode: 'only' | 'chain') =>
-    window.pipeline.runStep(details.run.id, step.id, branchId, mode, appendBatch ? { appendBatch: true } : undefined)
+    window.pipeline.runStep(
+      details.run.id,
+      step.id,
+      branchId,
+      mode,
+      appendBatch || forcedAppend ? { appendBatch: true } : undefined
+    )
   return (
     <>
-      {canAppend && (
+      {canAppend && !forcedAppend && (
         <label className="check">
           <input type="checkbox" checked={appendBatch} onChange={(event) => setAppendBatch(event.target.checked)} />
           Новый ряд
         </label>
       )}
-      {canAppend && <p className="field-note">Если элементов столько же, они добавятся следующим рядом и не заменят текущие.</p>}
+      {canAppend && forcedAppend && <p className="field-note">В схеме шага включено «каждый повтор — новый ряд»: элементы добавятся следующим рядом.</p>}
+      {canAppend && !forcedAppend && <p className="field-note">Если элементов столько же, они добавятся следующим рядом и не заменят текущие.</p>}
       <div className="row">
         <button className="btn" type="button" disabled={busy} onClick={() => void act(() => runAgain('only'))}>
           Только этот шаг

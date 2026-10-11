@@ -1,4 +1,8 @@
+import { effectiveStep } from '@core/step-ref'
 import type { StepDefinition, WorkflowGraph } from '@core/types'
+import { validateWorkflowTemplates } from '@core/variables'
+
+export { effectiveStep }
 
 export function childMap(steps: StepDefinition[]): Map<string, StepDefinition[]> {
   const map = new Map<string, StepDefinition[]>()
@@ -12,8 +16,9 @@ export function childMap(steps: StepDefinition[]): Map<string, StepDefinition[]>
   return map
 }
 
-export function isCollectMerge(step: StepDefinition): boolean {
-  return step.type === 'merge' && step.config.mode === 'collect'
+export function isCollectMerge(step: StepDefinition, steps?: StepDefinition[]): boolean {
+  const resolved = steps ? effectiveStep(step, steps) : step
+  return resolved.type === 'merge' && resolved.config.mode === 'collect'
 }
 
 export function innerDependents(stepId: string, steps: StepDefinition[]): StepDefinition[] {
@@ -24,7 +29,7 @@ export function innerDependents(stepId: string, steps: StepDefinition[]): StepDe
   while (stack.length) {
     const next = stack.pop()
     if (!next || seen.has(next.id)) continue
-    if (isCollectMerge(next)) continue
+    if (isCollectMerge(next, steps)) continue
     seen.add(next.id)
     out.push(next)
     stack.push(...(children.get(next.id) ?? []))
@@ -195,6 +200,12 @@ export function validateGraph(graph: WorkflowGraph): string[] {
       errors.push(`У входа «${input.label}» нет вариантов выбора`)
     }
   }
+  const snippetKeys = new Set<string>()
+  for (const snippet of graph.snippets ?? []) {
+    if (!KEY.test(snippet.key)) errors.push(`Некорректный ключ фрагмента «${snippet.key}»`)
+    if (snippetKeys.has(snippet.key)) errors.push(`Повторяется ключ фрагмента «${snippet.key}»`)
+    snippetKeys.add(snippet.key)
+  }
   const keys = new Set<string>()
   const ids = new Set(graph.steps.map((step) => step.id))
   for (const step of graph.steps) {
@@ -204,7 +215,16 @@ export function validateGraph(graph: WorkflowGraph): string[] {
     for (const dep of step.dependsOn) {
       if (!ids.has(dep)) errors.push(`Шаг «${step.name}» ссылается на отсутствующую зависимость`)
     }
-    if (step.type === 'fanout' && !step.iterate) errors.push(`Шаг «${step.name}» не раскладывает массив`)
+    if (step.use) {
+      if (step.use === step.key) errors.push(`Шаг «${step.name}» ссылается сам на себя`)
+      else if (!graph.steps.some((item) => item.key === step.use)) {
+        errors.push(`Шаг «${step.name}» ссылается на неизвестный шаг «${step.use}»`)
+      } else if (hasUseCycle(step, graph.steps)) {
+        errors.push(`Шаг «${step.name}» участвует в цикле ссылок use`)
+      }
+    }
+    const resolved = effectiveStep(step, graph.steps)
+    if (resolved.type === 'fanout' && !resolved.iterate) errors.push(`Шаг «${step.name}» не раскладывает массив`)
     if (step.iterate && !step.iterate.over.trim()) {
       errors.push(`У шага «${step.name}» не указан источник ветвления`)
     }
@@ -214,16 +234,28 @@ export function validateGraph(graph: WorkflowGraph): string[] {
     if (step.iterate?.noteAlias && !KEY.test(step.iterate.noteAlias)) {
       errors.push(`Некорректное имя текста у шага «${step.name}»`)
     }
-    if (step.type === 'ai' && step.config.outputFormat === 'json' && step.config.jsonSchema) {
-      if (typeof step.config.jsonSchema !== 'object') errors.push(`JSON Schema шага «${step.name}» должна быть объектом`)
+    if (resolved.type === 'ai' && resolved.config.outputFormat === 'json' && resolved.config.jsonSchema) {
+      if (typeof resolved.config.jsonSchema !== 'object') errors.push(`JSON Schema шага «${step.name}» должна быть объектом`)
     }
-    if (step.type === 'merge' && step.config.mode === 'collect') {
-      if (!step.dependsOn.includes(step.config.fromFanoutStepId)) {
+    if (resolved.type === 'merge' && resolved.config.mode === 'collect') {
+      if (!step.dependsOn.includes(resolved.config.fromFanoutStepId)) {
         errors.push(`Сборка «${step.name}» должна зависеть от шага, который создаёт ветки`)
       }
     }
   }
   const sorted = topoSort(graph.steps)
   if (!sorted.ok) errors.push(sorted.message)
+  errors.push(...validateWorkflowTemplates(graph))
   return errors
+}
+
+function hasUseCycle(step: StepDefinition, steps: StepDefinition[]): boolean {
+  const seen = new Set<string>()
+  let current: StepDefinition | undefined = step
+  while (current?.use) {
+    if (seen.has(current.id)) return true
+    seen.add(current.id)
+    current = steps.find((item) => item.key === current!.use)
+  }
+  return false
 }

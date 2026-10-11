@@ -74,6 +74,13 @@ export type IterateConfig = {
   alias: string
   launch: 'all' | 'manual'
   noteAlias?: string
+  /** Если true, повторный запуск всегда добавляет новый ряд веток, а не обновляет текущие на месте. */
+  appendOnRerun?: boolean
+}
+
+export type WorkflowSnippet = {
+  key: string
+  content: string
 }
 
 export type AIStepConfig = {
@@ -157,6 +164,10 @@ type StepBase = {
   dependsOn: string[]
   stopAfter: boolean
   iterate: IterateConfig | null
+  /** Ключ другого шага: type и config берутся от него, свои только положение, зависимости и ветвление. */
+  use?: string
+  /** Доп. ветка в схеме: рисуется рамкой под точкой крепления, не в основной колонке. */
+  sideBranch?: boolean
 }
 
 export type StepDefinition = StepBase &
@@ -172,6 +183,8 @@ export type StepDefinition = StepBase &
 
 export type WorkflowGraph = {
   inputs: InputDefinition[]
+  /** Переиспользуемые куски текста для промптов: {{snippets.ключ}} */
+  snippets?: WorkflowSnippet[]
   steps: StepDefinition[]
 }
 
@@ -417,5 +430,6 @@ export type VariableContext = {
   aliases: Record<string, unknown>
   globals?: Record<string, unknown>
   project?: Record<string, unknown>
+  snippets?: Record<string, string>
   prev?: { output: unknown }
 }

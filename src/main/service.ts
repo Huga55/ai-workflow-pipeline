@@ -155,7 +155,7 @@ export class AppService {
     return this.database.listWorkflows(projectId)
   }
 
-  createWorkflow(projectId: string, input: { name: string; description?: string }, graph: WorkflowGraph = { inputs: [], steps: [] }): WorkflowDetails {
+  createWorkflow(projectId: string, input: { name: string; description?: string }, graph: WorkflowGraph = { inputs: [], snippets: [], steps: [] }): WorkflowDetails {
     this.database.getProject(projectId)
     const timestamp = nowIso()
     const id = createId()
@@ -200,13 +200,17 @@ export class AppService {
     const current = this.database.latestVersion(id)
     this.database.updateWorkflowMeta(id, input.name.trim() || 'Без названия', input.description.trim(), timestamp)
     if (stableStringify(current.graph) !== stableStringify(input.graph)) {
-      this.database.insertVersion({
-        id: createId(),
-        workflowId: id,
-        version: current.version + 1,
-        graph: input.graph,
-        createdAt: timestamp
-      })
+      if (this.database.countRunsForVersion(current.id) > 0) {
+        this.database.insertVersion({
+          id: createId(),
+          workflowId: id,
+          version: current.version + 1,
+          graph: input.graph,
+          createdAt: timestamp
+        })
+      } else {
+        this.database.updateVersionGraph(current.id, input.graph, timestamp)
+      }
     }
     const workflow = this.database.getWorkflowRow(id)
     this.database.touchProject(workflow.projectId, timestamp)

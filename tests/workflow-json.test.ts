@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { describe, it } from 'node:test'
+import { builderFlowLayout } from '@core/builder-flow'
 import { createNeurophotoGraph } from '@core/template'
 import { formatWorkflowJson, parseWorkflowJson } from '@core/workflow-json'
 
@@ -154,5 +155,114 @@ describe('workflow json', () => {
       const parsed = parseWorkflowJson(block[1], { createId: sequence() })
       assert.equal(parsed.ok, true, parsed.ok ? '' : parsed.errors.join('\n'))
     }
+  })
+
+  it('раскладывает sideBranch в рамку под родителем', () => {
+    const concept = {
+      id: 'c',
+      key: 'each_concept',
+      name: 'Концепт',
+      description: '',
+      type: 'fanout' as const,
+      order: 1,
+      dependsOn: [],
+      stopAfter: false,
+      iterate: { over: '{{x}}', alias: 'item', launch: 'all' as const },
+      config: {}
+    }
+    const shots = {
+      id: 's',
+      key: 'shot_generator',
+      name: 'Шоты',
+      description: '',
+      type: 'transform' as const,
+      order: 2,
+      dependsOn: ['c'],
+      stopAfter: false,
+      iterate: null,
+      config: { mode: 'template' as const, template: 'a' }
+    }
+    const brief = {
+      id: 'b',
+      key: 'extra_brief',
+      name: 'Доп. brief',
+      description: '',
+      type: 'manual' as const,
+      order: 3,
+      dependsOn: ['c'],
+      stopAfter: false,
+      iterate: null,
+      sideBranch: true,
+      config: { mode: 'text' as const, prompt: '?', allowEmpty: true }
+    }
+    const extra = {
+      id: 'e',
+      key: 'extra_shots',
+      name: 'Доп. шоты',
+      description: '',
+      type: 'transform' as const,
+      order: 4,
+      dependsOn: ['b'],
+      stopAfter: false,
+      iterate: null,
+      config: { mode: 'template' as const, template: 'b' }
+    }
+    const layout = builderFlowLayout([concept, shots, brief, extra])
+    assert.equal(layout.blocks.length, 2)
+    assert.equal(layout.blocks[0].step.key, 'each_concept')
+    assert.equal(layout.blocks[0].sides.length, 1)
+    assert.deepEqual(
+      layout.blocks[0].sides[0].steps.map((item) => item.key),
+      ['extra_brief', 'extra_shots']
+    )
+    assert.equal(layout.blocks[1].step.key, 'shot_generator')
+    assert.equal(layout.orphans.length, 0)
+  })
+
+  it('читает snippets, use и appendOnRerun', () => {
+    const parsed = parseWorkflowJson(
+      `{
+      "name": "Ссылки",
+      "inputs": [{ "name": "notes", "type": "text" }],
+      "snippets": [{ "key": "notes_block", "content": "{{#if inputs.notes}}N:{{inputs.notes}}{{/if}}" }],
+      "steps": [
+        {
+          "key": "base",
+          "name": "База",
+          "type": "ai",
+          "config": {
+            "provider": "openai",
+            "model": "gpt-4.1-mini",
+            "messages": [{ "role": "user", "content": "{{snippets.notes_block}}" }],
+            "outputFormat": "text"
+          }
+        },
+        {
+          "key": "copy",
+          "name": "Копия",
+          "type": "ai",
+          "use": "base",
+          "dependsOn": ["base"]
+        },
+        {
+          "key": "items",
+          "name": "Элементы",
+          "type": "fanout",
+          "dependsOn": ["copy"],
+          "iterate": { "over": "{{steps.copy.output}}", "alias": "item", "launch": "all", "appendOnRerun": true }
+        }
+      ]
+    }`,
+      { createId: sequence() }
+    )
+    assert.equal(parsed.ok, true, parsed.ok ? '' : parsed.errors.join('\n'))
+    if (!parsed.ok) return
+    assert.equal(parsed.document.graph.snippets?.[0]?.key, 'notes_block')
+    const copy = parsed.document.graph.steps.find((item) => item.key === 'copy')
+    assert.equal(copy?.use, 'base')
+    assert.equal(copy?.type, 'ai')
+    if (copy?.type === 'ai') assert.equal(copy.config.messages[0]?.content, '{{snippets.notes_block}}')
+    const items = parsed.document.graph.steps.find((item) => item.key === 'items')
+    assert.equal(items?.iterate?.appendOnRerun, true)
   })
 })

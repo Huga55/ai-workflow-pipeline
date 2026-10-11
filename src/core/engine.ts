@@ -1,6 +1,7 @@
 import { inferKind } from '@core/labels'
 import { branchLabel } from '@core/labels'
 import { chainStepIds, fanoutInnerSteps, hiddenDescendantIds, isCollectMerge, topoSort } from '@core/graph'
+import { effectiveStep } from '@core/step-ref'
 import { createId, nowIso } from '@core/ids'
 import { applyManualAction } from '@core/manual'
 import { createRunners, type StepRunner } from '@core/runners'
@@ -231,8 +232,9 @@ export class WorkflowEngine {
       if (!force && existing?.status === 'cancelled') return 'paused'
       if (existing?.status === 'running') return 'paused'
 
-      if (isCollectMerge(step)) {
-        const fanoutId = step.type === 'merge' && step.config.mode === 'collect' ? step.config.fromFanoutStepId : ''
+      if (isCollectMerge(step, steps)) {
+        const resolved = this.resolveStep(step, options.graph)
+        const fanoutId = resolved.type === 'merge' && resolved.config.mode === 'collect' ? resolved.config.fromFanoutStepId : ''
         const children = this.childBranches(options.runId, scope.branchId, fanoutId)
         if (children.some((branch) => branch.status !== 'completed')) return 'paused'
       }
@@ -276,7 +278,7 @@ export class WorkflowEngine {
         const active = branches
           .filter((branch) => branch.status !== 'cancelled')
           .sort((a, b) => a.itemIndex - b.itemIndex)
-        if (options.appendBatch || active.length !== resolved.value.length) {
+        if (options.appendBatch || step.iterate.appendOnRerun || active.length !== resolved.value.length) {
           preserved = new Set(branches.map((branch) => branch.id))
           const nextIndex = branches.reduce((max, branch) => Math.max(max, branch.itemIndex), -1) + 1
           const nextBatch = branches.reduce((max, branch) => Math.max(max, branch.batch ?? 0), -1) + 1
@@ -398,10 +400,11 @@ export class WorkflowEngine {
     this.store.insertExecution(execution)
     options.onProgress?.()
 
+    const resolved = this.resolveStep(step, options.graph)
     let outcome: StepOutcome
     try {
-      outcome = await this.runners[step.type]({
-        step,
+      outcome = await this.runners[resolved.type]({
+        step: resolved,
         ctx: this.buildContext(scope, options, step),
         graph: options.graph,
         signal: options.signal,
@@ -497,6 +500,8 @@ export class WorkflowEngine {
       if (output !== undefined) steps[item.key] = { output }
     }
     const previous = step ? previousStep(step, options.graph.steps) : null
+    const snippets: Record<string, string> = {}
+    for (const snippet of options.graph.snippets ?? []) snippets[snippet.key] = snippet.content
     return {
       inputs: options.inputs,
       steps,
@@ -505,8 +510,13 @@ export class WorkflowEngine {
       aliases,
       globals: options.globals ?? {},
       project: options.project ?? {},
+      snippets,
       prev: previous ? { output: this.findOutput(options.runId, previous.id, scope) } : undefined
     }
+  }
+
+  private resolveStep(step: StepDefinition, graph: WorkflowGraph): StepDefinition {
+    return effectiveStep(step, graph.steps)
   }
 
   private stepAllowed(step: StepDefinition, steps: StepDefinition[], allow: Set<string>): boolean {

@@ -9,7 +9,7 @@ import { createRunners } from '@core/runners'
 import { createNeurophotoGraph } from '@core/template'
 import type { StepDefinition, WorkflowGraph } from '@core/types'
 import { applyManualAction } from '@core/manual'
-import { interpolate, previousStep, resolvePath, variableCatalog } from '@core/variables'
+import { interpolate, interpolateParts, previousStep, resolvePath, validateTemplate, variableCatalog } from '@core/variables'
 
 function expect(actual: unknown) {
   return {
@@ -44,7 +44,7 @@ function step(partial: Partial<StepDefinition> & Pick<StepDefinition, 'id' | 'ke
 }
 
 function graph(steps: StepDefinition[]): WorkflowGraph {
-  return { inputs: [], steps }
+  return { inputs: [], snippets: [], steps }
 }
 
 async function run(engine: WorkflowEngine, store: MemoryStore, steps: StepDefinition[], extra: Record<string, unknown> = {}) {
@@ -112,6 +112,91 @@ describe('variables', () => {
       aliases: {}
     })
     expect(value).toBe('Кадр Gentle Drop')
+  })
+
+  it('includes #if blocks only when the value is present', () => {
+    const template = 'Тема: {{inputs.topic}}{{#if inputs.notes}}\nДополнительно:\n{{inputs.notes}}{{/if}}'
+    const ctx = { inputs: { topic: 'Свет', notes: 'Без теней' }, steps: {}, aliases: {} }
+    expect(interpolate(template, ctx)).toBe('Тема: Свет\nДополнительно:\nБез теней')
+    expect(interpolate(template, { ...ctx, inputs: { topic: 'Свет', notes: '' } })).toBe('Тема: Свет')
+    expect(interpolate(template, { ...ctx, inputs: { topic: 'Свет', notes: '   ' } })).toBe('Тема: Свет')
+  })
+
+  it('supports nested #if blocks', () => {
+    const template = '{{#if inputs.a}}A{{#if inputs.b}}+B{{/if}}{{/if}}'
+    expect(interpolate(template, { inputs: { a: '1', b: '2' }, steps: {}, aliases: {} })).toBe('A+B')
+    expect(interpolate(template, { inputs: { a: '1', b: '' }, steps: {}, aliases: {} })).toBe('A')
+    expect(interpolate(template, { inputs: { a: '', b: '2' }, steps: {}, aliases: {} })).toBe('')
+  })
+
+  it('keeps images inside a truthy #if in message parts', () => {
+    const image = { kind: 'image' as const, path: '/tmp/a.png', mime: 'image/png', name: 'a.png' }
+    const parts = interpolateParts('{{#if inputs.shot}}Кадр: {{inputs.shot}}{{/if}}', {
+      inputs: { shot: image },
+      steps: {},
+      aliases: {}
+    })
+    expect(parts).toEqual([
+      { type: 'text', text: 'Кадр: ' },
+      { type: 'image', path: '/tmp/a.png', mime: 'image/png', name: 'a.png' }
+    ])
+    expect(interpolateParts('{{#if inputs.shot}}Кадр: {{inputs.shot}}{{/if}}', {
+      inputs: { shot: null },
+      steps: {},
+      aliases: {}
+    })).toEqual([])
+  })
+
+  it('rejects broken #if syntax', () => {
+    expect(validateTemplate('{{#if inputs.notes}}текст')).toEqual(['Не закрыт {{#if inputs.notes}}'])
+    expect(validateTemplate('текст{{/if}}')).toEqual(['Лишний {{/if}} без открывающего {{#if}}'])
+    expect(validateTemplate('{{#if}}x{{/if}}')).toEqual(['В {{#if}} не указан путь'])
+    expect(validateTemplate('{{#if inputs.bad-name}}x{{/if}}')).toEqual([
+      'Некорректный путь «inputs.bad-name» в {{#if}}'
+    ])
+    expect(validateTemplate('{{#else}}x{{/else}}')).toEqual([
+      'Неизвестная конструкция {{#else}}',
+      'Неизвестная конструкция {{/else}}'
+    ])
+    expect(validateTemplate('{{#if inputs.notes}}ok{{/if}}')).toEqual([])
+  })
+
+  it('flags broken #if in the workflow graph', () => {
+    const broken = step({
+      id: 'ask',
+      key: 'ask',
+      type: 'ai',
+      order: 1,
+      config: {
+        provider: 'openai',
+        model: 'gpt-4.1-mini',
+        messages: [{ id: 'm1', role: 'user', content: '{{#if inputs.notes}}без закрытия' }],
+        outputFormat: 'text'
+      }
+    })
+    expect(validateGraph(graph([broken])).some((item) => item.includes('Не закрыт'))).toBe(true)
+  })
+
+  it('expands snippets with nested if blocks', () => {
+    const value = interpolate('Тема: {{inputs.topic}}\n{{snippets.notes_block}}', {
+      inputs: { topic: 'Свет', notes: 'Без теней' },
+      steps: {},
+      aliases: {},
+      snippets: {
+        notes_block: '{{#if inputs.notes}}\nДополнительно:\n{{inputs.notes}}\n{{/if}}'
+      }
+    })
+    expect(value).toBe('Тема: Свет\n\nДополнительно:\nБез теней\n')
+    expect(
+      interpolate('Тема: {{inputs.topic}}\n{{snippets.notes_block}}', {
+        inputs: { topic: 'Свет', notes: '' },
+        steps: {},
+        aliases: {},
+        snippets: {
+          notes_block: '{{#if inputs.notes}}\nДополнительно:\n{{inputs.notes}}\n{{/if}}'
+        }
+      })
+    ).toBe('Тема: Свет\n')
   })
 })
 

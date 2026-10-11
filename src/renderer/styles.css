@@ -322,6 +322,29 @@ textarea.json-editor:focus { border-color: var(--brass-deep); }
 }
 .flow-node.active, .flow-node:hover { border-color: var(--brass-deep); }
 .flow-node small, .flow-node em { color: var(--brass); font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; font-style: normal; }
+.side-branch {
+  box-sizing: border-box;
+  width: min(420px, 100%);
+  margin-top: 10px;
+  padding: 8px 8px 10px;
+  border: 1px dashed var(--brass);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--sunken) 88%, var(--brass) 12%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.side-branch-label {
+  align-self: stretch;
+  margin: 0 2px 6px;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--brass);
+}
+.side-branch .flow-col { width: 100%; }
+.side-branch .flow-node { width: 100%; }
+.side-branch .flow-edge { height: 12px; }
 .flow-fan { width: 100%; display: flex; flex-direction: column; align-items: center; gap: 8px; }
 .flow-branches { display: flex; gap: 14px; overflow-x: auto; width: 100%; padding: 4px 8px 12px; align-items: flex-start; }
 .flow-branch { flex: 0 0 360px; display: flex; flex-direction: column; align-items: center; min-width: 320px; }

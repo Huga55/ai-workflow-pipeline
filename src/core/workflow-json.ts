@@ -1,6 +1,8 @@
+import { defaultAiConfig } from '@core/factories'
 import { validateGraph } from '@core/graph'
 import { createId as newId } from '@core/ids'
 import { slugify, uniqueKey } from '@core/labels'
+import { effectiveStep } from '@core/step-ref'
 import type {
   AIMessageDraft,
   AIStepConfig,
@@ -14,7 +16,8 @@ import type {
   StepDefinition,
   StepType,
   TransformStepConfig,
-  WorkflowGraph
+  WorkflowGraph,
+  WorkflowSnippet
 } from '@core/types'
 
 const INPUT_TYPES = new Set<InputType>([
@@ -56,16 +59,35 @@ export type WorkflowJsonDocument = {
 export type WorkflowJsonResult = { ok: true; document: WorkflowJsonDocument } | { ok: false; errors: string[] }
 
 export function formatWorkflowJson(document: WorkflowJsonDocument): string {
-  return JSON.stringify(
-    {
-      name: document.name,
-      description: document.description,
-      inputs: document.graph.inputs,
-      steps: document.graph.steps
-    },
-    null,
-    2
-  )
+  const payload: Record<string, unknown> = {
+    name: document.name,
+    description: document.description,
+    inputs: document.graph.inputs
+  }
+  if (document.graph.snippets?.length) payload.snippets = document.graph.snippets
+  payload.steps = document.graph.steps.map(formatStep)
+  return JSON.stringify(payload, null, 2)
+}
+
+function formatStep(step: StepDefinition): Record<string, unknown> {
+  const out: Record<string, unknown> = {
+    id: step.id,
+    key: step.key,
+    name: step.name,
+    description: step.description,
+    type: step.type,
+    order: step.order,
+    dependsOn: step.dependsOn,
+    stopAfter: step.stopAfter,
+    iterate: step.iterate
+  }
+  if (step.sideBranch) out.sideBranch = true
+  if (step.use) {
+    out.use = step.use
+    return out
+  }
+  out.config = step.config
+  return out
 }
 
 export type WorkflowJsonParseOptions = {
@@ -84,11 +106,12 @@ export function parseWorkflowJson(text: string, options: WorkflowJsonParseOption
   if (!isRecord(raw)) return { ok: false, errors: ['Корень JSON должен быть объектом с полями name, description, inputs и steps'] }
 
   const errors: string[] = []
-  onlyKeys(raw, ['name', 'description', 'inputs', 'steps'], 'корень', errors)
+  onlyKeys(raw, ['name', 'description', 'inputs', 'snippets', 'steps'], 'корень', errors)
   const name = readString(raw, 'name', 'name', errors, '') ?? ''
   const description = readString(raw, 'description', 'description', errors, '') ?? ''
   if (!Array.isArray(raw.inputs)) errors.push('inputs должен быть массивом')
   if (!Array.isArray(raw.steps)) errors.push('steps должен быть массивом')
+  if ('snippets' in raw && !Array.isArray(raw.snippets)) errors.push('snippets должен быть массивом')
   if (!Array.isArray(raw.inputs) || !Array.isArray(raw.steps)) return { ok: false, errors }
 
   const session: ParseSession = {
@@ -105,6 +128,15 @@ export function parseWorkflowJson(text: string, options: WorkflowJsonParseOption
     if (input) inputs.push(input)
   })
 
+  const snippets: WorkflowSnippet[] = []
+  const takenSnippetKeys = new Set<string>()
+  if (Array.isArray(raw.snippets)) {
+    raw.snippets.forEach((item, index) => {
+      const snippet = parseSnippet(item, index, takenSnippetKeys, errors)
+      if (snippet) snippets.push(snippet)
+    })
+  }
+
   const takenKeys = new Set<string>()
   const pending: PendingStep[] = []
   raw.steps.forEach((item, index) => {
@@ -116,12 +148,46 @@ export function parseWorkflowJson(text: string, options: WorkflowJsonParseOption
   const byId = new Map(pending.map((item) => [item.step.id, item.step]))
   const byKey = new Map(pending.map((item) => [item.step.key, item.step.id]))
   const steps = pending.map((item) => resolveStep(item, byId, byKey, session.aliases, errors))
+  applyUseLinks(steps, errors)
   if (errors.length) return { ok: false, errors }
 
-  const graph = { inputs, steps }
+  const graph = { inputs, ...(snippets.length ? { snippets } : {}), steps }
   const issues = validateGraph(graph)
   if (issues.length) return { ok: false, errors: issues }
   return { ok: true, document: { name, description, graph } }
+}
+
+function parseSnippet(raw: unknown, index: number, taken: Set<string>, errors: string[]): WorkflowSnippet | null {
+  const path = `snippets[${index}]`
+  if (!isRecord(raw)) {
+    errors.push(`${path} должен быть объектом`)
+    return null
+  }
+  onlyKeys(raw, ['key', 'content'], path, errors)
+  const key = readString(raw, 'key', `${path}.key`, errors)
+  const content = readString(raw, 'content', `${path}.content`, errors, '')
+  if (!key || content === undefined) return null
+  if (!key.trim()) {
+    errors.push(`${path}.key: укажите ключ`)
+    return null
+  }
+  if (taken.has(key)) errors.push(`${path}: повторяется ключ «${key}»`)
+  taken.add(key)
+  return { key, content }
+}
+
+function applyUseLinks(steps: StepDefinition[], errors: string[]) {
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i]
+    if (!step.use) continue
+    const source = steps.find((item) => item.key === step.use)
+    if (!source) {
+      errors.push(`Шаг «${step.name}»: use ссылается на неизвестный шаг «${step.use}»`)
+      continue
+    }
+    const resolved = effectiveStep(source, steps)
+    steps[i] = { ...step, type: resolved.type, config: structuredClone(resolved.config) } as StepDefinition
+  }
 }
 
 type PendingStep = {
@@ -183,8 +249,9 @@ function parseStep(raw: unknown, index: number, takenKeys: Set<string>, session:
     errors.push(`${path} должен быть объектом`)
     return null
   }
-  onlyKeys(raw, ['id', 'key', 'name', 'description', 'type', 'order', 'dependsOn', 'stopAfter', 'iterate', 'config'], path, errors)
-  const type = readEnum(raw, 'type', `${path}.type`, STEP_TYPES, errors)
+  onlyKeys(raw, ['id', 'key', 'name', 'description', 'type', 'order', 'dependsOn', 'stopAfter', 'iterate', 'config', 'use', 'sideBranch'], path, errors)
+  const use = readString(raw, 'use', `${path}.use`, errors)
+  const type = readEnum(raw, 'type', `${path}.type`, STEP_TYPES, errors, use ? 'ai' : undefined)
   const explicitName = readString(raw, 'name', `${path}.name`, errors)
   const explicitKey = readString(raw, 'key', `${path}.key`, errors)
   const label = explicitName?.trim() || explicitKey?.trim() || ''
@@ -198,14 +265,21 @@ function parseStep(raw: unknown, index: number, takenKeys: Set<string>, session:
   const description = readString(raw, 'description', `${path}.description`, errors, '')
   const order = readNumber(raw, 'order', `${path}.order`, errors, index + 1)
   const stopAfter = readBoolean(raw, 'stopAfter', `${path}.stopAfter`, errors, false)
+  const sideBranch = readBoolean(raw, 'sideBranch', `${path}.sideBranch`, errors, false)
   const dependsOn = readDepends(raw.dependsOn, `${path}.dependsOn`, errors)
-  const iterate = readIterate(raw, path, type, errors)
-  if (!type || !label || description === undefined || order === undefined || stopAfter === undefined || !dependsOn || iterate === undefined) {
+  const iterate = readIterate(raw, path, use ? undefined : type, errors)
+  if (!type || !label || description === undefined || order === undefined || stopAfter === undefined || sideBranch === undefined || !dependsOn || iterate === undefined) {
     return null
   }
 
+  if (use && 'config' in raw) {
+    errors.push(`${path}: при use поле config не пишите — берётся из шага «${use}»`)
+  }
+
   const previousStep = session.previous?.steps.find((item) => item.key === key)
-  const config = parseConfig(type, raw.config, `${path}.config`, previousStep, session)
+  const config = use
+    ? { config: placeholderConfig(type), skipStepIds: undefined as string[] | undefined, fromFanoutStepId: undefined as string | undefined, fromStepId: undefined as string | undefined }
+    : parseConfig(type, raw.config, `${path}.config`, previousStep, session)
   if (!config) return null
   const id = assignId(readString(raw, 'id', `${path}.id`, errors), previousStep?.id, path, session)
   const step = {
@@ -218,9 +292,30 @@ function parseStep(raw: unknown, index: number, takenKeys: Set<string>, session:
     stopAfter,
     iterate: iterate,
     type,
-    config: config.config
+    config: config.config,
+    ...(use ? { use } : {}),
+    ...(sideBranch ? { sideBranch: true } : {})
   } as StepDefinition
   return { step, dependsOn, skipStepIds: config.skipStepIds, fromFanoutStepId: config.fromFanoutStepId, fromStepId: config.fromStepId }
+}
+
+function placeholderConfig(type: StepType): StepDefinition['config'] {
+  switch (type) {
+    case 'ai':
+      return defaultAiConfig()
+    case 'transform':
+      return { mode: 'template', template: '' }
+    case 'parse':
+      return { source: '', mode: 'json' }
+    case 'manual':
+      return { mode: 'text', prompt: '', allowEmpty: true }
+    case 'merge':
+      return { mode: 'object', sources: [] }
+    case 'input':
+      return { keys: [] }
+    case 'fanout':
+      return {}
+  }
 }
 
 function parseConfig(
@@ -437,7 +532,7 @@ function readIterate(raw: Record<string, unknown>, path: string, type: StepType 
     errors.push(`${iteratePath} должен быть объектом или null`)
     return undefined
   }
-  onlyKeys(raw.iterate, ['over', 'alias', 'launch', 'noteAlias'], iteratePath, errors)
+  onlyKeys(raw.iterate, ['over', 'alias', 'launch', 'noteAlias', 'appendOnRerun'], iteratePath, errors)
   const over = readString(raw.iterate, 'over', `${iteratePath}.over`, errors, '')
   const alias = readString(raw.iterate, 'alias', `${iteratePath}.alias`, errors, 'item')
   const launch = readEnum(raw.iterate, 'launch', `${iteratePath}.launch`, new Set(['all', 'manual'] as const), errors, 'all')
@@ -447,6 +542,11 @@ function readIterate(raw: Record<string, unknown>, path: string, type: StepType 
     const noteAlias = readString(raw.iterate, 'noteAlias', `${iteratePath}.noteAlias`, errors)
     if (noteAlias === undefined) return undefined
     if (noteAlias) iterate.noteAlias = noteAlias
+  }
+  if ('appendOnRerun' in raw.iterate) {
+    const appendOnRerun = readBoolean(raw.iterate, 'appendOnRerun', `${iteratePath}.appendOnRerun`, errors)
+    if (appendOnRerun === undefined) return undefined
+    if (appendOnRerun) iterate.appendOnRerun = true
   }
   return iterate
 }

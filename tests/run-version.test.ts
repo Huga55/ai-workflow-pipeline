@@ -16,6 +16,7 @@ function step(partial: Partial<StepDefinition> & Pick<StepDefinition, 'id' | 'ke
 }
 
 function graph(steps: StepDefinition[], inputs: WorkflowGraph['inputs'] = []): WorkflowGraph {
+  // snippets optional for backward-compatible fixtures
   return { inputs, steps }
 }
 

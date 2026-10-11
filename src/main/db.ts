@@ -291,6 +291,18 @@ export class AppDatabase {
     )
   }
 
+  updateVersionGraph(id: string, graph: WorkflowGraph, updatedAt: string): void {
+    this.run(`UPDATE workflow_versions SET snapshot_json = ?, created_at = ? WHERE id = ?`, JSON.stringify(graph), updatedAt, id)
+  }
+
+  countRunsForVersion(workflowVersionId: string): number {
+    const row = this.get<{ total: number }>(
+      `SELECT COUNT(*) AS total FROM runs WHERE workflow_version_id = ?`,
+      workflowVersionId
+    )
+    return row?.total ?? 0
+  }
+
   listVersionMeta(workflowId: string): { id: string; version: number; createdAt: string }[] {
     return this.all(
       `SELECT id, version, created_at AS createdAt FROM workflow_versions WHERE workflow_id = ? ORDER BY version DESC`,

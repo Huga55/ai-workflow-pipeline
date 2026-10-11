@@ -1,5 +1,6 @@
 import { createId } from '@core/ids'
 import { slugify, uniqueKey } from '@core/labels'
+import { effectiveStep } from '@core/step-ref'
 import type {
   AIStepConfig,
   InputDefinition,
@@ -15,7 +16,19 @@ import type {
 } from '@core/types'
 
 export function emptyGraph(): WorkflowGraph {
-  return { inputs: [], steps: [] }
+  return { inputs: [], snippets: [], steps: [] }
+}
+
+export function createLinkedStep(source: StepDefinition, graph: WorkflowGraph, name?: string): StepDefinition {
+  const from = effectiveStep(source, graph.steps)
+  const linked = createStep(from.type, graph, name ?? `${source.name} (ссылка)`)
+  return {
+    ...linked,
+    type: from.type,
+    config: structuredClone(from.config),
+    use: source.key,
+    iterate: null
+  } as StepDefinition
 }
 
 export function createInput(partial: Partial<InputDefinition> & { label?: string } = {}): InputDefinition {

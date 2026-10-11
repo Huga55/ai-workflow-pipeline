@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { createId } from '@core/ids'
-import { createInput, createStep } from '@core/factories'
-import { topoSort, validateGraph } from '@core/graph'
+import { builderFlowLayout, type BuilderSideBranch } from '@core/builder-flow'
+import { createInput, createLinkedStep, createStep } from '@core/factories'
+import { effectiveStep, validateGraph } from '@core/graph'
 import { INPUT_TYPE_LABEL, STEP_TYPE_HINT, STEP_TYPE_LABEL, slugify, uniqueKey } from '@core/labels'
 import { latestVariableVersion, type VariablePools } from '@core/variables'
-import type { AIMessageDraft, InputDefinition, InputType, StepDefinition, StepType, WorkflowDetails, WorkflowGraph } from '@core/types'
+import type { AIMessageDraft, InputDefinition, InputType, StepDefinition, StepType, WorkflowDetails, WorkflowGraph, WorkflowSnippet } from '@core/types'
 import { formatWorkflowJson, parseWorkflowJson, type WorkflowJsonDocument } from '@core/workflow-json'
 import { copyText, errorText, Hint, TemplateField, VariablePoolsContext } from '../ui'
 
@@ -31,7 +32,7 @@ export function WorkflowPage({
   const [details, setDetails] = useState<WorkflowDetails | null>(null)
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
-  const [graph, setGraph] = useState<WorkflowGraph>({ inputs: [], steps: [] })
+  const [graph, setGraph] = useState<WorkflowGraph>({ inputs: [], snippets: [], steps: [] })
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [dirty, setDirty] = useState(false)
   const [restored, setRestored] = useState(false)
@@ -225,17 +226,24 @@ export function WorkflowPage({
     if (readOnly) return
     const document = documentForSave()
     if (!document) return
+    const graphIssues = validateGraph(document.graph)
+    if (graphIssues.length) {
+      setError(graphIssues.join('\n'))
+      return
+    }
     try {
       const next = await window.pipeline.saveWorkflow(workflowId, {
         name: document.name,
         description: document.description,
         graph: document.graph
       })
+      setError(null)
       setDetails(next)
       setDirty(false)
       snapshot.current = { ...snapshot.current, name: document.name, description: document.description, graph: document.graph, dirty: false }
       setRestored(false)
-      notify(`Сохранено: версия ${next.version.version}`)
+      const bumped = next.version.version !== details?.version.version
+      notify(bumped ? `Сохранено: версия ${next.version.version}` : `Сохранено в версии ${next.version.version}`)
       if (version) onVersion(undefined)
     } catch (reason) {
       setError(errorText(reason))
@@ -257,7 +265,7 @@ export function WorkflowPage({
 
   if (!details) return <div className="page">{error ? <div className="error">{error}</div> : 'Загрузка…'}</div>
 
-  const orderedSteps = topoSort(graph.steps)
+  const flow = builderFlowLayout(graph.steps)
   return (
     <VariablePoolsContext.Provider value={pools}>
     <div className="split">
@@ -287,19 +295,42 @@ export function WorkflowPage({
             Добавить вход
           </button>
         )}
+        <p className="section-label">Фрагменты</p>
+        {(graph.snippets ?? []).map((snippet) => (
+          <button key={snippet.key} className="step-tab" type="button" onClick={() => setSelectedId(`snippet:${snippet.key}`)}>
+            <span>{snippet.key}</span>
+            <small>{`{{snippets.${snippet.key}}}`}</small>
+          </button>
+        ))}
+        {!structureLocked && (
+          <button
+            className="ghost"
+            type="button"
+            onClick={() => {
+              const taken = new Set((graph.snippets ?? []).map((item) => item.key))
+              const key = uniqueKey('block', taken)
+              const snippets = [...(graph.snippets ?? []), { key, content: '' }]
+              edit({ ...graph, snippets })
+              setSelectedId(`snippet:${key}`)
+            }}
+          >
+            Добавить фрагмент
+          </button>
+        )}
         <p className="section-label">Граф шагов</p>
         <div className="flow">
-          {orderedSteps.ok &&
-            orderedSteps.steps.map((step, index) => (
-              <div key={step.id} className="flow-col">
-                {index > 0 && <div className="flow-edge" />}
-                <button className={`flow-node ${selectedId === step.id ? 'active' : ''}`} type="button" onClick={() => setSelectedId(step.id)}>
-                  <span>{step.name}</span>
-                  <small title={STEP_TYPE_HINT[step.type]}>{STEP_TYPE_LABEL[step.type]}</small>
-                  {step.iterate && <em>массив → отдельные ветки</em>}
-                </button>
-              </div>
-            ))}
+          {flow.orphans.map((side) => (
+            <SideBranchBox key={side.root.id} side={side} graph={graph} selectedId={selectedId} onSelect={setSelectedId} />
+          ))}
+          {flow.blocks.map((block, index) => (
+            <div key={block.step.id} className="flow-col">
+              {(index > 0 || flow.orphans.length > 0) && <div className="flow-edge" />}
+              <FlowNodeButton step={block.step} graph={graph} selectedId={selectedId} onSelect={setSelectedId} />
+              {block.sides.map((side) => (
+                <SideBranchBox key={side.root.id} side={side} graph={graph} selectedId={selectedId} onSelect={setSelectedId} />
+              ))}
+            </div>
+          ))}
         </div>
         {!structureLocked && (
           <div className="row" style={{ marginTop: 8 }}>
@@ -406,6 +437,21 @@ export function WorkflowPage({
         ) : (
           <>
         {!!issues.length && <div className="banner">{issues.join('\n')}</div>}
+        {selectedId?.startsWith('snippet:') && (
+          <SnippetEditor
+            snippet={(graph.snippets ?? []).find((item) => item.key === selectedId.slice('snippet:'.length)) ?? null}
+            readOnly={readOnly}
+            onChange={(snippet, previousKey) => {
+              const snippets = (graph.snippets ?? []).map((item) => (item.key === previousKey ? snippet : item))
+              edit({ ...graph, snippets })
+              setSelectedId(`snippet:${snippet.key}`)
+            }}
+            onDelete={(key) => {
+              edit({ ...graph, snippets: (graph.snippets ?? []).filter((item) => item.key !== key) })
+              setSelectedId(null)
+            }}
+          />
+        )}
         {graph.inputs.find((input) => input.id === selectedId) && (
           <InputEditor
             input={graph.inputs.find((input) => input.id === selectedId)!}
@@ -423,6 +469,11 @@ export function WorkflowPage({
             step={selected}
             readOnly={readOnly}
             onChange={(step) => edit({ ...graph, steps: graph.steps.map((item) => (item.id === step.id ? step : item)) })}
+            onLink={() => {
+              const linked = createLinkedStep(selected, graph)
+              edit({ ...graph, steps: [...graph.steps, linked] })
+              setSelectedId(linked.id)
+            }}
             onDelete={() => {
               edit({
                 ...graph,
@@ -512,12 +563,104 @@ function InputEditor({
   )
 }
 
+function FlowNodeButton({
+  step,
+  graph,
+  selectedId,
+  onSelect
+}: {
+  step: StepDefinition
+  graph: WorkflowGraph
+  selectedId: string | null
+  onSelect: (id: string) => void
+}) {
+  const resolved = effectiveStep(step, graph.steps)
+  return (
+    <button className={`flow-node ${selectedId === step.id ? 'active' : ''}`} type="button" onClick={() => onSelect(step.id)}>
+      <span>{step.name}</span>
+      <small title={STEP_TYPE_HINT[resolved.type]}>
+        {STEP_TYPE_LABEL[resolved.type]}
+        {step.use ? ` ← ${step.use}` : ''}
+      </small>
+      {step.iterate && <em>массив → отдельные ветки</em>}
+      {step.sideBranch && <em>доп. ветка</em>}
+    </button>
+  )
+}
+
+function SideBranchBox({
+  side,
+  graph,
+  selectedId,
+  onSelect
+}: {
+  side: BuilderSideBranch
+  graph: WorkflowGraph
+  selectedId: string | null
+  onSelect: (id: string) => void
+}) {
+  return (
+    <div className="side-branch">
+      <div className="side-branch-label">Доп. ветка</div>
+      {side.steps.map((step, index) => (
+        <div key={step.id} className="flow-col">
+          {index > 0 && <div className="flow-edge" />}
+          <FlowNodeButton step={step} graph={graph} selectedId={selectedId} onSelect={onSelect} />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function SnippetEditor({
+  snippet,
+  readOnly,
+  onChange,
+  onDelete
+}: {
+  snippet: WorkflowSnippet | null
+  readOnly: boolean
+  onChange: (snippet: WorkflowSnippet, previousKey: string) => void
+  onDelete: (key: string) => void
+}) {
+  if (!snippet) return <p className="meta">Фрагмент не найден</p>
+  return (
+    <div>
+      <h2>Фрагмент</h2>
+      <label className="field">
+        <span>Ключ</span>
+        <input
+          value={snippet.key}
+          disabled={readOnly}
+          onChange={(event) => onChange({ ...snippet, key: event.target.value }, snippet.key)}
+        />
+        <p className="field-note">В промптах: {`{{snippets.${snippet.key || 'ключ'}}}`}</p>
+      </label>
+      <label className="field">
+        <span>Текст</span>
+        <textarea
+          rows={10}
+          value={snippet.content}
+          disabled={readOnly}
+          onChange={(event) => onChange({ ...snippet, content: event.target.value }, snippet.key)}
+        />
+      </label>
+      {!readOnly && (
+        <button className="danger" type="button" onClick={() => onDelete(snippet.key)}>
+          Удалить фрагмент
+        </button>
+      )}
+    </div>
+  )
+}
+
 function StepEditor({
   graph,
   step,
   readOnly,
   onChange,
   onDelete,
+  onLink,
   onMove
 }: {
   graph: WorkflowGraph
@@ -525,8 +668,11 @@ function StepEditor({
   readOnly: boolean
   onChange: (step: StepDefinition) => void
   onDelete: () => void
+  onLink: () => void
   onMove: (direction: number) => void
 }) {
+  const resolved = effectiveStep(step, graph.steps)
+  const linked = Boolean(step.use)
   return (
     <div>
       <div className="row">
@@ -537,6 +683,11 @@ function StepEditor({
         <button className="ghost" type="button" disabled={readOnly} onClick={() => onMove(1)}>
           Ниже
         </button>
+        {!readOnly && !linked && (
+          <button className="ghost" type="button" onClick={onLink}>
+            Ссылка на этот шаг
+          </button>
+        )}
       </div>
       <label className="field">
         <span>Название</span>
@@ -547,10 +698,46 @@ function StepEditor({
         <input value={step.key} disabled={readOnly} onChange={(event) => onChange({ ...step, key: event.target.value })} />
       </label>
       <label className="field">
+        <span>Ссылка на шаг (use)</span>
+        <select
+          value={step.use ?? ''}
+          disabled={readOnly}
+          onChange={(event) => {
+            const use = event.target.value || undefined
+            if (!use) {
+              const { use: _drop, ...rest } = step
+              onChange(rest as StepDefinition)
+              return
+            }
+            const source = graph.steps.find((item) => item.key === use)
+            if (!source) return
+            const from = effectiveStep(source, graph.steps)
+            onChange({
+              ...step,
+              use,
+              type: from.type,
+              config: structuredClone(from.config)
+            } as StepDefinition)
+          }}
+        >
+          <option value="">Нет — свой config</option>
+          {graph.steps
+            .filter((item) => item.id !== step.id && item.key !== step.key)
+            .map((item) => (
+              <option key={item.id} value={item.key}>
+                {item.name} ({item.key})
+              </option>
+            ))}
+        </select>
+        <p className="field-note">
+          Если задано, type и config берутся из того шага. Здесь можно менять только положение, зависимости и ветвление.
+        </p>
+      </label>
+      <label className="field">
         <span>Тип</span>
         <select
-          value={step.type}
-          disabled={readOnly}
+          value={resolved.type}
+          disabled={readOnly || linked}
           onChange={(event) => {
             const fresh = createStep(event.target.value as StepType, { ...graph, steps: graph.steps.filter((item) => item.id !== step.id) })
             onChange({
@@ -572,7 +759,7 @@ function StepEditor({
             </option>
           ))}
         </select>
-        <p className="field-note">{STEP_TYPE_HINT[step.type]}</p>
+        <p className="field-note">{STEP_TYPE_HINT[resolved.type]}</p>
       </label>
       <label className="field">
         <span>Зависит от</span>
@@ -600,7 +787,26 @@ function StepEditor({
         <input type="checkbox" checked={step.stopAfter} disabled={readOnly} onChange={(event) => onChange({ ...step, stopAfter: event.target.checked })} />
         Остановиться после этого шага
       </label>
-      {step.type !== 'fanout' && (
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={Boolean(step.sideBranch)}
+          disabled={readOnly}
+          onChange={(event) =>
+            onChange(
+              event.target.checked
+                ? { ...step, sideBranch: true }
+                : (() => {
+                    const { sideBranch: _drop, ...rest } = step
+                    return rest as StepDefinition
+                  })()
+            )
+          }
+        />
+        Дополнительная ветка в схеме
+      </label>
+      <p className="field-note">Рисуется рамкой под шагом, от которого зависит, вместе со своей цепочкой. Основную колонку не расширяет.</p>
+      {resolved.type !== 'fanout' && (
       <fieldset>
         <legend className="section-label">Ветвление</legend>
         <p className="field-note">Если предыдущий шаг вернул массив, этот шаг выполнится отдельно для каждого элемента. Для новой схемы удобнее отдельный шаг «Элементы», а этот переключатель оставлен для уже собранных цепочек.</p>
@@ -669,11 +875,31 @@ function StepEditor({
                 </p>
               </label>
             ) : null}
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={Boolean(step.iterate.appendOnRerun)}
+                disabled={readOnly}
+                onChange={(event) =>
+                  onChange({
+                    ...step,
+                    iterate: { ...step.iterate!, appendOnRerun: event.target.checked || undefined }
+                  })
+                }
+              />
+              Каждый повтор — новый ряд
+            </label>
+            <p className="field-note">Если включено, повторный запуск добавляет элементы новым рядом и не обновляет старые на месте.</p>
           </>
         )}
       </fieldset>
       )}
-      <StepConfig graph={graph} step={step} readOnly={readOnly} onChange={onChange} />
+      {linked ? (
+        <p className="banner">
+          Содержимое шага из <code>{step.use}</code>. Правьте оригинал; здесь меняются только положение и ветвление.
+        </p>
+      ) : null}
+      <StepConfig graph={graph} step={resolved} readOnly={readOnly || linked} onChange={linked ? () => undefined : onChange} />
       {!readOnly && (
         <button className="danger" type="button" onClick={onDelete}>
           Удалить шаг
@@ -860,6 +1086,23 @@ function StepConfig({
             <option value="manual">Вручную, по одной</option>
           </select>
         </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={Boolean(iterate.appendOnRerun)}
+            disabled={readOnly}
+            onChange={(event) =>
+              onChange({
+                ...step,
+                type: 'fanout',
+                iterate: { ...iterate, appendOnRerun: event.target.checked || undefined },
+                config: {}
+              })
+            }
+          />
+          Каждый повтор — новый ряд
+        </label>
+        <p className="field-note">Если включено, повторный запуск добавляет элементы новым рядом и не обновляет старые на месте.</p>
       </div>
     )
   }

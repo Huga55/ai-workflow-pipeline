@@ -1,10 +1,17 @@
-import { topoSort } from '@core/graph'
 import { isStoredFile } from '@core/media'
+import { effectiveStep } from '@core/step-ref'
 import type { ContentPart, NamedVariable, VariableContext, VariableVersion, WorkflowGraph, StepDefinition } from '@core/types'
+
+const SNIPPET_DEPTH = 8
 
 export type PathSegment = { kind: 'prop'; name: string } | { kind: 'index'; index: number }
 
 const TOKEN = /\{\{\s*([^}]+)\s*\}\}/g
+
+type TemplateNode =
+  | { kind: 'text'; text: string }
+  | { kind: 'var'; path: string; raw: string }
+  | { kind: 'if'; path: string; children: TemplateNode[] }
 
 export function parsePath(input: string): PathSegment[] | null {
   const path = input.trim()
@@ -57,6 +64,7 @@ export function resolvePath(path: string, ctx: VariableContext): ResolveResult {
   else if (root === 'steps') value = ctx.steps
   else if (root === 'globals') value = ctx.globals ?? {}
   else if (root === 'project') value = ctx.project ?? {}
+  else if (root === 'snippets') value = ctx.snippets ?? {}
   else if (root === 'current_item') value = ctx.current_item
   else if (root === 'current_index') value = ctx.current_index
   else if (root === 'prev') {
@@ -93,7 +101,7 @@ function walk(value: unknown, segments: PathSegment[], path: string): ResolveRes
 export function resolveReference(ref: string, ctx: VariableContext): ResolveResult {
   const trimmed = ref.trim()
   const whole = trimmed.match(/^\{\{\s*([^}]+)\s*\}\}$/)
-  if (whole) return resolvePath(whole[1], ctx)
+  if (whole && !isDirective(whole[1].trim())) return resolvePath(whole[1], ctx)
   if (trimmed.includes('{{')) {
     const parts = interpolateParts(trimmed, ctx)
     if (parts.length === 1 && parts[0].type === 'text') return { ok: true, value: parts[0].text }
@@ -108,17 +116,157 @@ function partsToDisplay(parts: ContentPart[]): string {
     .join('')
 }
 
+function isDirective(inner: string): boolean {
+  return inner === '/if' || inner.startsWith('#') || inner.startsWith('/')
+}
+
+export function isPresent(value: unknown): boolean {
+  if (value == null) return false
+  if (typeof value === 'string') return value.trim() !== ''
+  if (typeof value === 'number') return !Number.isNaN(value)
+  if (typeof value === 'boolean') return value
+  if (Array.isArray(value)) return value.length > 0
+  return true
+}
+
+export function validateTemplate(template: string): string[] {
+  const errors: string[] = []
+  const stack: string[] = []
+  const flags = new RegExp(TOKEN.source, 'g')
+  let match: RegExpExecArray | null
+  while ((match = flags.exec(template))) {
+    const inner = match[1].trim()
+    if (inner === '/if') {
+      if (!stack.length) errors.push('Лишний {{/if}} без открывающего {{#if}}')
+      else stack.pop()
+      continue
+    }
+    if (inner.startsWith('#if')) {
+      const path = inner.slice(3).trim()
+      if (!path) errors.push('В {{#if}} не указан путь')
+      else if (!parsePath(path)) errors.push(`Некорректный путь «${path}» в {{#if}}`)
+      stack.push(path)
+      continue
+    }
+    if (inner.startsWith('#') || inner.startsWith('/')) {
+      errors.push(`Неизвестная конструкция {{${inner}}}`)
+    }
+  }
+  if (stack.length === 1) errors.push(`Не закрыт {{#if ${stack[0]}}}`)
+  else if (stack.length > 1) {
+    errors.push(`Не закрыты {{#if}}: ${stack.map((path) => path || '…').join(', ')}`)
+  }
+  return errors
+}
+
+export function templatesInStep(step: StepDefinition, steps: StepDefinition[] = []): string[] {
+  const resolved = steps.length ? effectiveStep(step, steps) : step
+  const out: string[] = []
+  if (step.iterate?.over) out.push(step.iterate.over)
+  switch (resolved.type) {
+    case 'ai':
+      for (const message of resolved.config.messages) out.push(message.content)
+      break
+    case 'transform':
+      if (resolved.config.template) out.push(resolved.config.template)
+      if (resolved.config.source) out.push(resolved.config.source)
+      if (resolved.config.value) out.push(resolved.config.value)
+      break
+    case 'parse':
+      out.push(resolved.config.source)
+      break
+    case 'manual':
+      out.push(resolved.config.prompt)
+      if (resolved.config.source) out.push(resolved.config.source)
+      break
+    case 'merge':
+      if (resolved.config.mode === 'object') {
+        for (const source of resolved.config.sources) out.push(source.ref)
+      }
+      break
+    default:
+      break
+  }
+  return out
+}
+
+export function validateWorkflowTemplates(graph: WorkflowGraph): string[] {
+  const errors: string[] = []
+  for (const snippet of graph.snippets ?? []) {
+    for (const issue of validateTemplate(snippet.content)) {
+      errors.push(`Фрагмент «${snippet.key}»: ${issue}`)
+    }
+  }
+  for (const step of graph.steps) {
+    if (step.use) continue
+    for (const template of templatesInStep(step, graph.steps)) {
+      for (const issue of validateTemplate(template)) {
+        errors.push(`Шаг «${step.name}»: ${issue}`)
+      }
+    }
+  }
+  return errors
+}
+
+function isSnippetPath(path: string): boolean {
+  return path.trim().startsWith('snippets.')
+}
+
+function parseTemplate(template: string): TemplateNode[] {
+  const root: TemplateNode[] = []
+  const stack: { path: string; children: TemplateNode[] }[] = [{ path: '', children: root }]
+  let last = 0
+  const flags = new RegExp(TOKEN.source, 'g')
+  let match: RegExpExecArray | null
+  while ((match = flags.exec(template))) {
+    const current = stack[stack.length - 1]
+    if (!current) break
+    if (match.index > last) current.children.push({ kind: 'text', text: template.slice(last, match.index) })
+    const raw = match[0]
+    const inner = match[1].trim()
+    last = match.index + raw.length
+    if (inner === '/if') {
+      if (stack.length === 1) {
+        current.children.push({ kind: 'text', text: raw })
+        continue
+      }
+      stack.pop()
+      continue
+    }
+    if (inner.startsWith('#if')) {
+      const path = inner.slice(3).trim()
+      const node: TemplateNode = { kind: 'if', path, children: [] }
+      current.children.push(node)
+      stack.push({ path, children: node.children })
+      continue
+    }
+    if (isDirective(inner)) {
+      current.children.push({ kind: 'text', text: raw })
+      continue
+    }
+    current.children.push({ kind: 'var', path: inner, raw })
+  }
+  if (last < template.length) {
+    const current = stack[stack.length - 1]
+    if (current) current.children.push({ kind: 'text', text: template.slice(last) })
+  }
+  return root
+}
+
+function conditionValue(path: string, ctx: VariableContext): unknown {
+  const resolved = resolvePath(path, ctx)
+  return resolved.ok ? resolved.value : null
+}
+
 export function interpolate(template: string, ctx: VariableContext): unknown {
   const whole = template.match(/^\{\{\s*([^}]+)\s*\}\}$/)
-  if (whole) {
-    const resolved = resolvePath(whole[1], ctx)
+  if (whole && !isDirective(whole[1].trim())) {
+    const path = whole[1].trim()
+    if (isSnippetPath(path)) return renderText(parseTemplate(template), ctx, 0)
+    const resolved = resolvePath(path, ctx)
     return resolved.ok ? resolved.value : template
   }
-  return template.replace(TOKEN, (raw, path: string) => {
-    const resolved = resolvePath(path.trim(), ctx)
-    if (!resolved.ok) return raw
-    return stringifyValue(resolved.value)
-  })
+  return renderText(parseTemplate(template), ctx, 0)
 }
 
 export function interpolateParts(template: string, ctx: VariableContext): ContentPart[] {
@@ -141,19 +289,55 @@ export function interpolateParts(template: string, ctx: VariableContext): Conten
     }
     pushText(stringifyValue(value))
   }
-
-  let last = 0
-  const flags = new RegExp(TOKEN.source, 'g')
-  let match: RegExpExecArray | null
-  while ((match = flags.exec(template))) {
-    pushText(template.slice(last, match.index))
-    const resolved = resolvePath(match[1].trim(), ctx)
-    if (!resolved.ok) pushText(match[0])
-    else append(resolved.value)
-    last = match.index + match[0].length
+  const walkNodes = (nodes: TemplateNode[], depth: number) => {
+    for (const node of nodes) {
+      if (node.kind === 'text') {
+        pushText(node.text)
+        continue
+      }
+      if (node.kind === 'var') {
+        const resolved = resolvePath(node.path, ctx)
+        if (!resolved.ok) {
+          pushText(node.raw)
+          continue
+        }
+        if (isSnippetPath(node.path) && typeof resolved.value === 'string') {
+          if (depth < SNIPPET_DEPTH) walkNodes(parseTemplate(resolved.value), depth + 1)
+          continue
+        }
+        append(resolved.value)
+        continue
+      }
+      if (isPresent(conditionValue(node.path, ctx))) walkNodes(node.children, depth)
+    }
   }
-  pushText(template.slice(last))
+  walkNodes(parseTemplate(template), 0)
   return parts
+}
+
+function renderText(nodes: TemplateNode[], ctx: VariableContext, depth: number): string {
+  let out = ''
+  for (const node of nodes) {
+    if (node.kind === 'text') {
+      out += node.text
+      continue
+    }
+    if (node.kind === 'var') {
+      const resolved = resolvePath(node.path, ctx)
+      if (!resolved.ok) {
+        out += node.raw
+        continue
+      }
+      if (isSnippetPath(node.path) && typeof resolved.value === 'string') {
+        if (depth < SNIPPET_DEPTH) out += renderText(parseTemplate(resolved.value), ctx, depth + 1)
+        continue
+      }
+      out += stringifyValue(resolved.value)
+      continue
+    }
+    if (isPresent(conditionValue(node.path, ctx))) out += renderText(node.children, ctx, depth)
+  }
+  return out
 }
 
 export function stringifyValue(value: unknown): string {
@@ -178,10 +362,8 @@ export function previousStep(step: StepDefinition, steps: StepDefinition[]): Ste
     .filter((item): item is StepDefinition => Boolean(item))
   if (!deps.length) return null
   if (deps.length === 1) return deps[0]
-  const sorted = topoSort(steps)
-  const order = sorted.ok ? sorted.steps : [...steps].sort((a, b) => a.order - b.order)
   return deps.reduce((best, item) =>
-    order.findIndex((candidate) => candidate.id === item.id) > order.findIndex((candidate) => candidate.id === best.id) ? item : best
+    item.order > best.order || (item.order === best.order && item.name.localeCompare(best.name) > 0) ? item : best
   )
 }
 
@@ -202,6 +384,16 @@ export function variableCatalog(graph: WorkflowGraph, step?: StepDefinition, poo
       hint: input.name
     }))
   })
+  if (graph.snippets?.length) {
+    groups.push({
+      title: 'Фрагменты',
+      items: graph.snippets.map((snippet) => ({
+        path: `snippets.${snippet.key}`,
+        label: snippet.key,
+        hint: 'фрагмент'
+      }))
+    })
+  }
   const named = (title: string, root: 'globals' | 'project', items: { name: string; label: string; version?: number }[] | undefined) => {
     if (!items?.length) return
     groups.push({
