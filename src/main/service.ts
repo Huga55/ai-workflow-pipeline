@@ -7,13 +7,14 @@ import { runVersionFit } from '@core/run-version'
 import { stableStringify } from '@core/json'
 import { formatRunNumber } from '@core/labels'
 import { validateGraph } from '@core/graph'
-import { isAbortError, settleRunStatus, WorkflowEngine } from '@core/engine'
-import { latestVariableVersion } from '@core/variables'
+import { isAbortError, settleRunStatus, WorkflowEngine, type OpenChatsRequest } from '@core/engine'
+import { interpolateParts, latestVariableVersion } from '@core/variables'
 import { createRunners } from '@core/runners'
 import { createNeurophotoGraph } from '@core/template'
 import type { AIRequest, AIResponse, NamedVariable, Project, ProviderStatus, RunDetails, StoredFile, UserActionPayload, WorkflowDetails, WorkflowDraft, WorkflowGraph } from '@core/types'
 import { AppDatabase, SqliteEngineStore } from './db'
 import { createProvider, PROVIDERS } from './providers'
+import { QwenBrowser } from './qwen-browser'
 import { SecretStore } from './secrets'
 
 const MIME: Record<string, string> = {
@@ -30,6 +31,7 @@ const MIME: Record<string, string> = {
 
 export class AppService {
   private engine: WorkflowEngine
+  private qwen: QwenBrowser
   private active = new Map<string, AbortController>()
   private inflight = new Map<string, Promise<RunDetails>>()
 
@@ -37,8 +39,18 @@ export class AppService {
     private database: AppDatabase,
     private secrets: SecretStore,
     private mediaDir: string,
-    private onRunUpdated: (runId: string) => void
+    private onRunUpdated: (runId: string) => void,
+    profileDir = path.join(path.dirname(mediaDir), 'qwen-profile')
   ) {
+    this.qwen = new QwenBrowser(
+      profileDir,
+      (runId, chatKey, branchId) => this.database.getRunChat(runId, chatKey, branchId),
+      (runId, chatKey, branchId, url) => this.database.saveRunChat(runId, chatKey, branchId, url),
+      () => ({
+        token: this.secrets.get('qwen-token'),
+        refreshToken: this.secrets.get('qwen-refresh-token')
+      })
+    )
     const store = new SqliteEngineStore(database)
     this.engine = new WorkflowEngine(
       store,
@@ -471,6 +483,13 @@ export class AppService {
     return this.withLock(runId, (signal) => this.engine.skipStep(this.baseOptions(runId, signal), stepId, branchId))
   }
 
+  async repairStepJson(runId: string, stepId: string, branchId: string): Promise<RunDetails> {
+    this.guardRunnable(runId)
+    return this.withLock(runId, (signal) =>
+      Promise.resolve(this.engine.repairStepJson(this.baseOptions(runId, signal), stepId, branchId))
+    )
+  }
+
   async submitUserAction(runId: string, executionId: string, payload: UserActionPayload): Promise<RunDetails> {
     const details = this.guardRunnable(runId)
     const execution = details.executions.find((item) => item.id === executionId)
@@ -538,7 +557,82 @@ export class AppService {
     return this.getProviderStatus()
   }
 
+  async closeBrowser(): Promise<void> {
+    await this.qwen.close()
+  }
+
+  connectQwen(): Promise<{ loggedIn: boolean }> {
+    return this.qwen.connect()
+  }
+
+  qwenTokenStatus(): { token: boolean; refreshToken: boolean } {
+    return { token: this.secrets.has('qwen-token'), refreshToken: this.secrets.has('qwen-refresh-token') }
+  }
+
+  async setQwenSession(input: { token?: string; refreshToken?: string }): Promise<{ token: boolean; refreshToken: boolean }> {
+    const token = input.token?.trim() ?? ''
+    const refreshToken = input.refreshToken?.trim() ?? ''
+    if (!token && !refreshToken) throw new Error('Введите token или refresh token')
+    if (token) this.secrets.set('qwen-token', token)
+    if (refreshToken) this.secrets.set('qwen-refresh-token', refreshToken)
+    await this.qwen.applySession()
+    return this.qwenTokenStatus()
+  }
+
+  clearQwenSession(): { token: boolean; refreshToken: boolean } {
+    this.secrets.clear('qwen-token')
+    this.secrets.clear('qwen-refresh-token')
+    return this.qwenTokenStatus()
+  }
+
+  private async openPlaywrightChats(runId: string, request: OpenChatsRequest, signal?: AbortSignal): Promise<void> {
+    const graph = this.database.getRun(runId).graph
+    if ((graph.runtime ?? 'api') !== 'playwright') return
+    for (const chat of graph.chats ?? []) {
+      if (chat.scope !== request.scope) continue
+      this.database.markRunChat(runId, chat.key, request.branchId, 'running', '')
+      this.onRunUpdated(runId)
+      try {
+        await this.qwen.ensure({
+          runId,
+          chatKey: chat.key,
+          branchId: request.branchId,
+          parts: interpolateParts(chat.instruction, request.ctx),
+          signal
+        })
+        this.database.markRunChat(runId, chat.key, request.branchId, 'completed', '')
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Не удалось открыть чат'
+        this.database.markRunChat(runId, chat.key, request.branchId, 'failed', message)
+        throw error
+      } finally {
+        this.onRunUpdated(runId)
+      }
+    }
+  }
+
   private async generate(request: AIRequest, signal?: AbortSignal): Promise<AIResponse> {
+    if (request.runtime === 'playwright') {
+      if (!request.chat || !request.runId) throw new Error('Шаг не привязан к чату')
+      if (!request.messages.length) throw new Error('Пустое сообщение в чат')
+      const turns: string[] = []
+      for (const message of request.messages) {
+        const raw = await this.qwen.ask({
+          runId: request.runId,
+          chatKey: request.chat,
+          branchId: request.branchId ?? '',
+          parts: message.content,
+          signal
+        })
+        turns.push(raw)
+      }
+      return {
+        raw: turns[turns.length - 1] ?? '',
+        providerResponse: { chat: request.chat, branchId: request.branchId ?? '', turns },
+        model: request.model,
+        provider: 'qwen'
+      }
+    }
     const apiKey = this.secrets.get(request.provider)
     if (!apiKey) throw new Error(`Нет API-ключа для провайдера «${request.provider}». Добавьте его в настройках.`)
     return createProvider(request.provider, apiKey).generate(request, signal)
@@ -624,7 +718,8 @@ export class AppService {
       globals: this.variableMap('global', null),
       project: this.variableMap('project', details.run.projectId),
       signal,
-      onProgress: () => this.onRunUpdated(runId)
+      onProgress: () => this.onRunUpdated(runId),
+      openChats: (request: OpenChatsRequest) => this.openPlaywrightChats(runId, request, signal)
     }
   }
 

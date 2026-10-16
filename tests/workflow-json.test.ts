@@ -265,4 +265,98 @@ describe('workflow json', () => {
     const items = parsed.document.graph.steps.find((item) => item.key === 'items')
     assert.equal(items?.iterate?.appendOnRerun, true)
   })
+
+  it('читает playwright-чаты и не пускает их в api-workflow', () => {
+    const parsed = parseWorkflowJson(
+      `{
+      "name": "Qwen",
+      "runtime": "playwright",
+      "chats": [
+        { "key": "analyst", "instruction": "Смотри только на фото." },
+        { "key": "shots", "scope": "branch", "instruction": "Кадры для {{current_item}}" }
+      ],
+      "inputs": [],
+      "steps": [
+        {
+          "key": "ids",
+          "name": "Идентификаторы",
+          "type": "ai",
+          "config": {
+            "provider": "qwen",
+            "model": "qwen",
+            "chat": "analyst",
+            "messages": [{ "role": "user", "content": "Верни идентификаторы." }],
+            "outputFormat": "text"
+          }
+        }
+      ]
+    }`,
+      { createId: sequence() }
+    )
+    assert.equal(parsed.ok, true, parsed.ok ? '' : parsed.errors.join('\n'))
+    if (!parsed.ok) return
+    assert.equal(parsed.document.graph.runtime, 'playwright')
+    assert.equal(parsed.document.graph.chats?.[1]?.scope, 'branch')
+    const formatted = formatWorkflowJson(parsed.document)
+    const again = parseWorkflowJson(formatted, { createId: sequence() })
+    assert.equal(again.ok, true, again.ok ? '' : again.errors.join('\n'))
+
+    const mixed = parseWorkflowJson(`{
+      "name": "Смешение",
+      "chats": [{ "key": "analyst", "instruction": "Ты аналитик." }],
+      "inputs": [],
+      "steps": []
+    }`)
+    assert.equal(mixed.ok, false)
+    if (!mixed.ok) assert.match(mixed.errors.join('\n'), /playwright/)
+  })
+
+  it('читает условие сообщения и отбрасывает битый путь', () => {
+    const parsed = parseWorkflowJson(
+      `{
+      "name": "Условие",
+      "inputs": [{ "name": "ref", "label": "Реф", "type": "image", "required": false }],
+      "steps": [{
+        "key": "look",
+        "name": "Разбор",
+        "type": "ai",
+        "config": {
+          "provider": "openai",
+          "model": "gpt-4.1-mini",
+          "outputFormat": "text",
+          "messages": [
+            { "role": "user", "content": "Оригинал" },
+            { "role": "user", "content": "Реф {{inputs.ref}}", "when": { "op": "or", "paths": ["inputs.ref"] } }
+          ]
+        }
+      }]
+    }`,
+      { createId: sequence() }
+    )
+    assert.equal(parsed.ok, true, parsed.ok ? '' : parsed.errors.join('\n'))
+    if (!parsed.ok) return
+    const step = parsed.document.graph.steps[0]
+    assert.equal(step?.type, 'ai')
+    if (step?.type !== 'ai') return
+    assert.deepEqual(step.config.messages[1]?.when, { op: 'or', paths: ['inputs.ref'] })
+    const again = parseWorkflowJson(formatWorkflowJson(parsed.document), { createId: sequence() })
+    assert.equal(again.ok, true, again.ok ? '' : again.errors.join('\n'))
+
+    const broken = parseWorkflowJson(`{
+      "name": "Битый путь",
+      "inputs": [],
+      "steps": [{
+        "key": "look",
+        "name": "Разбор",
+        "type": "ai",
+        "config": {
+          "provider": "openai",
+          "model": "gpt-4.1-mini",
+          "messages": [{ "role": "user", "content": "Реф", "when": { "op": "and", "paths": ["inputs.bad-name"] } }]
+        }
+      }]
+    }`)
+    assert.equal(broken.ok, false)
+    if (!broken.ok) assert.match(broken.errors.join('\n'), /bad-name/)
+  })
 })

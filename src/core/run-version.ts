@@ -4,6 +4,9 @@ export type RunVersionFit = { ok: true } | { ok: false; reasons: string[] }
 
 export function runVersionFit(current: WorkflowGraph, next: WorkflowGraph, details: Pick<RunDetails, 'executions' | 'branches' | 'run'>): RunVersionFit {
   const reasons: string[] = []
+  if ((current.runtime ?? 'api') !== (next.runtime ?? 'api') && (details.executions.length || details.branches.length)) {
+    reasons.push('Нельзя сменить основу workflow у уже начатого запуска')
+  }
   const executed = new Set(details.executions.map((item) => item.stepId))
   const branched = new Set(details.branches.map((item) => item.sourceStepId))
   const done = new Set([...executed, ...branched])

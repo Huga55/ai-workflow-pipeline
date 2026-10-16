@@ -62,7 +62,7 @@ export function createStep(type: StepType, graph: WorkflowGraph, name?: string):
   }
   switch (type) {
     case 'ai':
-      return { ...base, type, config: defaultAiConfig() }
+      return { ...base, type, config: defaultAiConfig(graph) }
     case 'transform':
       return { ...base, type, config: { mode: 'template', template: '' } }
     case 'parse':
@@ -101,7 +101,16 @@ function defaultStepName(type: StepType): string {
   }
 }
 
-export function defaultAiConfig(): AIStepConfig {
+export function defaultAiConfig(graph?: WorkflowGraph): AIStepConfig {
+  if (graph?.runtime === 'playwright') {
+    return {
+      provider: 'qwen',
+      model: 'qwen',
+      messages: [{ id: createId(), role: 'user', content: '' }],
+      outputFormat: 'json',
+      chat: graph.chats?.[0]?.key
+    }
+  }
   return {
     provider: 'openai',
     model: 'gpt-4.1-mini',

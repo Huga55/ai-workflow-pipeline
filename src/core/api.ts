@@ -56,6 +56,7 @@ export type PipelineApi = {
     options?: { appendBatch?: boolean }
   ) => Promise<RunDetails>
   skipStep: (runId: string, stepId: string, branchId: string) => Promise<RunDetails>
+  repairStepJson: (runId: string, stepId: string, branchId: string) => Promise<RunDetails>
   listVariables: (scope: 'global' | 'project', projectId?: string) => Promise<NamedVariable[]>
   saveVariable: (input: {
     scope: 'global' | 'project'
@@ -76,6 +77,10 @@ export type PipelineApi = {
   getProviderStatus: () => Promise<ProviderStatus>
   setProviderKey: (providerId: string, apiKey: string) => Promise<ProviderStatus>
   clearProviderKey: (providerId: string) => Promise<ProviderStatus>
+  connectQwen: () => Promise<{ loggedIn: boolean }>
+  qwenTokenStatus: () => Promise<{ token: boolean; refreshToken: boolean }>
+  setQwenSession: (input: { token?: string; refreshToken?: string }) => Promise<{ token: boolean; refreshToken: boolean }>
+  clearQwenSession: () => Promise<{ token: boolean; refreshToken: boolean }>
   quit: () => Promise<void>
   exportData: () => Promise<TransferResult>
   importData: () => Promise<TransferResult>

@@ -61,6 +61,9 @@ export function registerIpc(service: AppService, getWindow: () => BrowserWindow 
       service.runStep(runId, stepId, branchId, mode, options)
   )
   ipcMain.handle('skipStep', (_event, runId: string, stepId: string, branchId: string) => service.skipStep(runId, stepId, branchId))
+  ipcMain.handle('repairStepJson', (_event, runId: string, stepId: string, branchId: string) =>
+    service.repairStepJson(runId, stepId, branchId)
+  )
   ipcMain.handle('listVariables', (_event, scope: 'global' | 'project', projectId?: string) => service.listVariables(scope, projectId))
   ipcMain.handle(
     'saveVariable',
@@ -84,6 +87,10 @@ export function registerIpc(service: AppService, getWindow: () => BrowserWindow 
   ipcMain.handle('getProviderStatus', () => service.getProviderStatus())
   ipcMain.handle('setProviderKey', (_event, providerId: string, apiKey: string) => service.setProviderKey(providerId, apiKey))
   ipcMain.handle('clearProviderKey', (_event, providerId: string) => service.clearProviderKey(providerId))
+  ipcMain.handle('connectQwen', () => service.connectQwen())
+  ipcMain.handle('qwenTokenStatus', () => service.qwenTokenStatus())
+  ipcMain.handle('setQwenSession', (_event, input: { token?: string; refreshToken?: string }) => service.setQwenSession(input))
+  ipcMain.handle('clearQwenSession', () => service.clearQwenSession())
   ipcMain.handle('pickFiles', async (_event, kind: 'image' | 'file', multiple: boolean) => {
     const win = getWindow()
     const options = {

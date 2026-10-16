@@ -1,6 +1,8 @@
+import { repairJson, validateJsonSchema } from '@core/json'
 import { inferKind } from '@core/labels'
 import { branchLabel } from '@core/labels'
 import { chainStepIds, fanoutInnerSteps, hiddenDescendantIds, isCollectMerge, topoSort } from '@core/graph'
+import { sideChains } from '@core/side-branch'
 import { effectiveStep } from '@core/step-ref'
 import { createId, nowIso } from '@core/ids'
 import { applyManualAction } from '@core/manual'
@@ -38,6 +40,14 @@ export type AdvanceOptions = {
   appendBatch?: boolean
   signal?: AbortSignal
   onProgress?: () => void
+  openChats?: (request: OpenChatsRequest) => Promise<void>
+}
+
+export type OpenChatsRequest = {
+  runId: string
+  scope: 'run' | 'branch'
+  branchId: string
+  ctx: VariableContext
 }
 
 type Scope = {
@@ -63,6 +73,8 @@ export class WorkflowEngine {
 
   async advance(options: AdvanceOptions): Promise<AdvanceResult> {
     this.sweepInterrupted(options.runId)
+    this.retireMisplacedSideWaits(options)
+    await this.prepareChats(this.rootScope(options.runId), options, 'run')
     if (options.retry) return this.runSingle(options, options.retry.stepId, options.retry.branchId)
     if (options.focus?.mode === 'only') return this.runSingle(options, options.focus.stepId, options.focus.branchId)
     if (options.focus?.mode === 'chain') {
@@ -143,6 +155,46 @@ export class WorkflowEngine {
     })
   }
 
+  repairStepJson(options: AdvanceOptions, stepId: string, branchId: string): AdvanceResult {
+    const step = options.graph.steps.find((item) => item.id === stepId)
+    if (!step) throw new Error('Шаг не найден')
+    const existing = this.effectiveExecution(options.runId, stepId, branchId)
+    if (!existing || existing.status !== 'failed' || !existing.rawResponse) {
+      throw new Error('Нет сырого ответа, который можно починить.')
+    }
+    if (!existing.error?.includes('корректный JSON')) throw new Error('Эта ошибка не из разбора JSON.')
+    const repaired = repairJson(existing.rawResponse)
+    if (!repaired.ok) throw new Error(repaired.error)
+    if (step.type === 'ai' && step.config.outputFormat === 'json' && step.config.jsonSchema) {
+      const check = validateJsonSchema(step.config.jsonSchema, repaired.value)
+      if (!check.ok) throw new Error(`JSON починился, но схема не сошлась:\n${check.error}`)
+    }
+    const started = nowIso()
+    const execution: StepExecution = {
+      id: createId(),
+      runId: options.runId,
+      stepId,
+      branchId,
+      attempt: existing.attempt + 1,
+      status: 'completed',
+      request: existing.request,
+      rawResponse: existing.rawResponse,
+      parsed: repaired.value,
+      error: null,
+      startedAt: started,
+      finishedAt: started,
+      durationMs: 0,
+      meta: { provider: existing.meta.provider, model: existing.meta.model, repairedJson: true },
+      createdAt: started
+    }
+    this.store.insertExecution(execution)
+    this.store.insertArtifact(this.artifact(options.runId, execution.id, repaired.value))
+    const branch = branchId ? this.store.listBranches(options.runId).find((item) => item.id === branchId) : undefined
+    if (branch?.status === 'failed') this.setBranchStatus(options.runId, branchId, 'paused')
+    options.onProgress?.()
+    return 'paused'
+  }
+
   private markSkipped(options: AdvanceOptions, stepId: string, branchId: string, output: unknown): void {
     const existing = this.effectiveExecution(options.runId, stepId, branchId)
     if (existing && (existing.status === 'completed' || existing.status === 'skipped' || existing.status === 'running')) return
@@ -186,6 +238,7 @@ export class WorkflowEngine {
       forceStepIds: new Set([stepId])
     }
     const scope = this.scopeForBranch(options.runId, branchId, null)
+    if (scope.branchId) await this.prepareChats(scope, options, 'branch')
     if (step.iterate && step.id !== scope.entryStepId) {
       return this.runFanout(step, options.graph.steps, scope, limited, true)
     }
@@ -208,17 +261,27 @@ export class WorkflowEngine {
 
   private async advanceScope(scope: Scope, steps: StepDefinition[], options: AdvanceOptions): Promise<AdvanceResult> {
     if (options.signal?.aborted) return 'paused'
+    if (scope.branchId) await this.prepareChats(scope, options, 'branch')
     const hidden = hiddenDescendantIds(steps, scope.entryStepId)
     const local = steps.filter((step) => !hidden.has(step.id))
     const sorted = topoSort(local)
     if (!sorted.ok) return this.failScope(scope, options, sorted.message)
 
+    const sideIds = sideIdsInScope(steps, local)
+    let sideResult: AdvanceResult = 'completed'
+    let mainResult: AdvanceResult = 'completed'
     for (const step of sorted.steps) {
       if (options.signal?.aborted) return 'paused'
+      const onSide = sideIds.has(step.id)
+      if (onSide ? sideResult !== 'completed' : mainResult !== 'completed') continue
       if (options.allowStepIds && !this.stepAllowed(step, steps, options.allowStepIds)) continue
+      const remember = (result: AdvanceResult) => {
+        if (result === 'completed') return
+        if (onSide) sideResult = result
+        else mainResult = result
+      }
       if (step.iterate && step.id !== scope.entryStepId) {
-        const fanout = await this.runFanout(step, steps, scope, options, false)
-        if (fanout !== 'completed') return fanout
+        remember(await this.runFanout(step, steps, scope, options, false))
         continue
       }
       const force = Boolean(options.forceStepIds?.has(step.id))
@@ -226,24 +289,40 @@ export class WorkflowEngine {
       if (!force && (existing?.status === 'completed' || existing?.status === 'skipped')) continue
       if (!force && existing?.status === 'waiting_for_user') {
         this.setBranchStatus(options.runId, scope.branchId, 'waiting_for_user')
-        return 'paused'
+        remember('paused')
+        continue
       }
-      if (!force && existing?.status === 'failed' && !existing.meta.interrupted) return 'failed'
-      if (!force && existing?.status === 'cancelled') return 'paused'
-      if (existing?.status === 'running') return 'paused'
+      if (!force && existing?.status === 'failed' && !existing.meta.interrupted) {
+        remember('failed')
+        continue
+      }
+      if (!force && existing?.status === 'cancelled') {
+        remember('paused')
+        continue
+      }
+      if (existing?.status === 'running') {
+        remember('paused')
+        continue
+      }
 
       if (isCollectMerge(step, steps)) {
         const resolved = this.resolveStep(step, options.graph)
         const fanoutId = resolved.type === 'merge' && resolved.config.mode === 'collect' ? resolved.config.fromFanoutStepId : ''
         const children = this.childBranches(options.runId, scope.branchId, fanoutId)
-        if (children.some((branch) => branch.status !== 'completed')) return 'paused'
+        if (children.some((branch) => branch.status !== 'completed')) {
+          remember('paused')
+          continue
+        }
       }
 
       const result = await this.executeStep(step, scope, options, force)
-      if (result !== 'completed') return result
-      if (options.untilStepId === step.id || step.stopAfter) return 'paused'
+      if (result !== 'completed') {
+        remember(result)
+        continue
+      }
+      if (options.untilStepId === step.id || step.stopAfter) remember('paused')
     }
-    return 'completed'
+    return mergeAdvance(sideResult, mainResult)
   }
 
   private async runFanout(
@@ -272,21 +351,33 @@ export class WorkflowEngine {
         )
         return 'failed'
       }
+      const items = resolved.value
       if (!branches.length) {
-        branches = resolved.value.map((item, index) => this.makeBranch(scope, step, options.runId, item, index, 0))
+        branches = items.map((item, index) => this.makeBranch(scope, step, options.runId, item, index, 0))
       } else {
         const active = branches
           .filter((branch) => branch.status !== 'cancelled')
           .sort((a, b) => a.itemIndex - b.itemIndex)
-        if (options.appendBatch || step.iterate.appendOnRerun || active.length !== resolved.value.length) {
+        const duplicate = [...itemRows(active)].reverse().find((row) => sameItems(row, items))
+        if (duplicate) {
+          items.forEach((item, index) => {
+            const existing = duplicate[index]
+            existing.item = item
+            existing.label = branchLabel(item, existing.itemIndex)
+            existing.alias = step.iterate?.alias || existing.alias
+            existing.noteAlias = step.iterate?.noteAlias?.trim() ?? ''
+            existing.status = 'pending'
+            this.store.updateBranch(existing)
+          })
+        } else if (options.appendBatch || step.iterate.appendOnRerun || active.length !== items.length) {
           preserved = new Set(branches.map((branch) => branch.id))
           const nextIndex = branches.reduce((max, branch) => Math.max(max, branch.itemIndex), -1) + 1
           const nextBatch = branches.reduce((max, branch) => Math.max(max, branch.batch ?? 0), -1) + 1
-          resolved.value.forEach((item, index) => {
+          items.forEach((item, index) => {
             branches.push(this.makeBranch(scope, step, options.runId, item, nextIndex + index, nextBatch))
           })
         } else {
-          resolved.value.forEach((item, index) => {
+          items.forEach((item, index) => {
             const existing = active[index]
             existing.item = item
             existing.label = branchLabel(item, existing.itemIndex)
@@ -309,9 +400,14 @@ export class WorkflowEngine {
       if (fresh.status === 'cancelled') continue
       const keep = preserved.has(fresh.id)
       const forceInner = !keep && inner.some((item) => options.forceStepIds?.has(item.id))
-      if (fresh.status === 'completed' && !forceInner) continue
+      const sequenceTail =
+        step.iterate.launch === 'sequence' &&
+        Boolean(options.onlyBranchId) &&
+        this.isSequenceTail(fresh, options.onlyBranchId, options.runId, step.id)
+      if (fresh.status === 'completed' && (sequenceTail || !forceInner)) continue
+      if (sequenceTail && fresh.status === 'failed') continue
       const selected = this.shouldRunBranch(fresh.id, options.onlyBranchId, options.runId)
-      if (!selected) continue
+      if (!selected && !sequenceTail) continue
       if (step.iterate.launch === 'manual' && fresh.status === 'pending') {
         const exact = options.onlyBranchId === fresh.id
         if (!exact && !options.startManualBranches) continue
@@ -319,11 +415,13 @@ export class WorkflowEngine {
       if (options.onlyBranchId === fresh.id && options.branchNote !== undefined) fresh.note = options.branchNote
       const child = this.childScope(scope, fresh, step.id)
       const redo = !keep && fresh.status === 'pending' && inner.some((item) => Boolean(this.effectiveExecution(options.runId, item.id, fresh.id)))
-      const branchOptions = keep
-        ? { ...options, forceStepIds: new Set([...(options.forceStepIds ?? [])].filter((id) => !inner.some((item) => item.id === id))) }
-        : redo
-          ? { ...options, forceStepIds: new Set([...(options.forceStepIds ?? []), ...inner.map((item) => item.id)]) }
-          : options
+      const branchOptions = sequenceTail
+        ? { ...options, onlyBranchId: undefined, forceStepIds: undefined }
+        : keep
+          ? { ...options, forceStepIds: new Set([...(options.forceStepIds ?? [])].filter((id) => !inner.some((item) => item.id === id))) }
+          : redo
+            ? { ...options, forceStepIds: new Set([...(options.forceStepIds ?? []), ...inner.map((item) => item.id)]) }
+            : options
       jobs.push({ fresh, child, branchOptions })
     }
 
@@ -351,6 +449,13 @@ export class WorkflowEngine {
       const results = await Promise.all(jobs.map((job) => finish(job)))
       if (options.signal?.aborted) return 'paused'
       if (results.includes('cancelled')) return 'cancelled'
+    } else if (step.iterate.launch === 'sequence') {
+      for (const job of jobs) {
+        const result = await finish(job)
+        if (options.signal?.aborted) return 'paused'
+        if (result === 'cancelled') return 'cancelled'
+        if (result !== 'completed') break
+      }
     } else {
       for (const job of jobs) {
         const result = await finish(job)
@@ -407,6 +512,8 @@ export class WorkflowEngine {
         step: resolved,
         ctx: this.buildContext(scope, options, step),
         graph: options.graph,
+        runId: options.runId,
+        branchId: scope.branchId,
         signal: options.signal,
         collectOutputs: (fanoutStepId, fromStepId) => this.collectOutputs(options.runId, scope.branchId, fanoutStepId, fromStepId)
       })
@@ -473,6 +580,17 @@ export class WorkflowEngine {
       const execution = this.effectiveExecution(runId, fromStepId, branch.id)
       if (execution?.status !== 'completed') return null
       return this.outputOf(runId, execution.id)
+    })
+  }
+
+  private async prepareChats(scope: Scope, options: AdvanceOptions, kind: 'run' | 'branch'): Promise<void> {
+    if ((options.graph.runtime ?? 'api') !== 'playwright' || !options.openChats) return
+    if (kind === 'branch' && !scope.branchId) return
+    await options.openChats({
+      runId: options.runId,
+      scope: kind,
+      branchId: kind === 'run' ? '' : scope.branchId,
+      ctx: this.buildContext(scope, options)
     })
   }
 
@@ -582,6 +700,23 @@ export class WorkflowEngine {
       .sort((a, b) => a.itemIndex - b.itemIndex)
   }
 
+  private isSequenceTail(branch: Branch, onlyBranchId: string, runId: string, fanoutStepId: string): boolean {
+    const branches = this.store.listBranches(runId)
+    const byId = new Map(branches.map((item) => [item.id, item]))
+    let cursor = byId.get(onlyBranchId)
+    let anchor: Branch | undefined
+    while (cursor) {
+      if (cursor.sourceStepId === fanoutStepId) {
+        anchor = cursor
+        break
+      }
+      cursor = cursor.parentBranchId ? byId.get(cursor.parentBranchId) : undefined
+    }
+    if (!anchor || anchor.id === branch.id) return false
+    if (branch.sourceStepId !== fanoutStepId || branch.parentBranchId !== anchor.parentBranchId) return false
+    return branch.itemIndex > anchor.itemIndex
+  }
+
   private shouldRunBranch(branchId: string, onlyBranchId: string | undefined, runId: string): boolean {
     if (!onlyBranchId) return true
     return this.isOnPath(branchId, onlyBranchId, runId)
@@ -680,6 +815,25 @@ export class WorkflowEngine {
     this.setBranchStatus(runId, branchId, status)
   }
 
+  private retireMisplacedSideWaits(options: AdvanceOptions): void {
+    const steps = options.graph.steps
+    const sideIds = new Set(sideChains(steps).flatMap((chain) => chain.stepIds))
+    if (!sideIds.size) return
+    const branches = new Map(this.store.listBranches(options.runId).map((branch) => [branch.id, branch]))
+    for (const execution of this.store.listExecutions(options.runId)) {
+      if (!sideIds.has(execution.stepId)) continue
+      if (execution.status !== 'waiting_for_user' && execution.status !== 'pending') continue
+      const owner = owningFanoutId(execution.stepId, steps)
+      const source = execution.branchId ? (branches.get(execution.branchId)?.sourceStepId ?? null) : null
+      if (owner === source) continue
+      execution.status = 'skipped'
+      execution.error = null
+      execution.finishedAt = nowIso()
+      this.store.updateExecution(execution)
+      this.refreshBranchStatus(options.runId, execution.branchId)
+    }
+  }
+
   private sweepInterrupted(runId: string): void {
     for (const execution of this.store.listExecutions(runId)) {
       if (execution.status !== 'running') continue
@@ -714,6 +868,61 @@ export class WorkflowEngine {
     this.store.insertExecution(execution)
     return 'failed'
   }
+}
+
+function owningFanoutId(stepId: string, steps: StepDefinition[]): string | null {
+  const owners = steps.filter((step) => step.iterate && fanoutInnerSteps(step.id, steps).some((inner) => inner.id === stepId))
+  const inner = owners.find(
+    (owner) => !owners.some((other) => other.id !== owner.id && fanoutInnerSteps(other.id, steps).some((item) => item.id === owner.id))
+  )
+  return inner?.id ?? null
+}
+
+function sideIdsInScope(steps: StepDefinition[], local: StepDefinition[]): Set<string> {
+  const localIds = new Set(local.map((step) => step.id))
+  const ids = new Set<string>()
+  for (const chain of sideChains(steps)) {
+    if (!localIds.has(chain.rootId)) continue
+    for (const id of chain.stepIds) {
+      if (localIds.has(id)) ids.add(id)
+    }
+  }
+  return ids
+}
+
+function mergeAdvance(left: AdvanceResult, right: AdvanceResult): AdvanceResult {
+  if (left === 'failed' || right === 'failed') return 'failed'
+  if (left === 'cancelled' || right === 'cancelled') return 'cancelled'
+  if (left === 'paused' || right === 'paused') return 'paused'
+  return 'completed'
+}
+
+function itemRows(branches: Branch[]): Branch[][] {
+  const groups = new Map<number, Branch[]>()
+  for (const branch of branches) {
+    const key = branch.batch ?? 0
+    const list = groups.get(key) ?? []
+    list.push(branch)
+    groups.set(key, list)
+  }
+  return [...groups.values()].map((list) => list.sort((left, right) => left.itemIndex - right.itemIndex))
+}
+
+function sameItems(branches: Branch[], items: unknown[]): boolean {
+  if (branches.length !== items.length) return false
+  return branches.every((branch, index) => canonical(branch.item) === canonical(items[index]))
+}
+
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => canonical(item)).join(',')}]`
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
 }
 
 export function isAbortError(error: string | null | undefined): boolean {

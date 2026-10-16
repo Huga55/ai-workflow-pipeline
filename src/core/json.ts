@@ -24,6 +24,118 @@ export function extractJson(text: string): unknown {
   throw new Error('Ответ не содержит корректный JSON')
 }
 
+/** Пробует обычный разбор, затем экранирует кавычки внутри строк и висячие запятые. Не бросает исключение. */
+export function repairJson(text: string): { ok: true; value: unknown } | { ok: false; error: string } {
+  try {
+    if (!text.trim()) return { ok: false, error: 'Не удалось починить JSON: ответ пустой.' }
+    const seen = new Set<string>()
+    for (const source of jsonCandidates(text)) {
+      if (seen.has(source)) continue
+      seen.add(source)
+      const escaped = escapeLooseQuotes(source)
+      for (const variant of [source, escaped, stripTrailingCommas(source), stripTrailingCommas(escaped)]) {
+        const parsed = tryParse(variant)
+        if (parsed.ok) return parsed
+      }
+    }
+    return { ok: false, error: 'Не удалось починить JSON. В ответе другая ошибка, кнопка её не исправляет.' }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : 'Не удалось починить JSON' }
+  }
+}
+
+function jsonCandidates(text: string): string[] {
+  const trimmed = text.trim().replace(/^\uFEFF/, '')
+  const list = [trimmed]
+  const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)
+  if (fence?.[1]) list.push(fence[1].trim())
+  const extras: string[] = []
+  for (const source of list) {
+    const object = sliceBetween(source, '{', '}')
+    const array = sliceBetween(source, '[', ']')
+    if (object) extras.push(object)
+    if (array) extras.push(array)
+  }
+  return [...list, ...extras]
+}
+
+function escapeLooseQuotes(text: string): string {
+  const out: string[] = []
+  let inString = false
+  let escaped = false
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    if (!inString) {
+      out.push(char)
+      if (char === '"') inString = true
+      continue
+    }
+    if (escaped) {
+      out.push(char)
+      escaped = false
+      continue
+    }
+    if (char === '\\') {
+      out.push(char)
+      escaped = true
+      continue
+    }
+    if (char === '"') {
+      if (closesString(text, index + 1)) {
+        out.push(char)
+        inString = false
+      } else out.push('\\"')
+      continue
+    }
+    if (char === '\n') {
+      out.push('\\n')
+      continue
+    }
+    if (char === '\r') {
+      out.push('\\r')
+      continue
+    }
+    out.push(char)
+  }
+  return out.join('')
+}
+
+function closesString(text: string, from: number): boolean {
+  let index = from
+  while (index < text.length && /\s/.test(text[index])) index += 1
+  if (index >= text.length) return true
+  const next = text[index]
+  return next === ',' || next === '}' || next === ']' || next === ':'
+}
+
+function stripTrailingCommas(text: string): string {
+  const out: string[] = []
+  let inString = false
+  let escaped = false
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    if (inString) {
+      out.push(char)
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+    if (char === '"') {
+      inString = true
+      out.push(char)
+      continue
+    }
+    if (char === ',') {
+      let next = index + 1
+      while (next < text.length && /\s/.test(text[next])) next += 1
+      if (text[next] === '}' || text[next] === ']') continue
+    }
+    out.push(char)
+  }
+  return out.join('')
+}
+
 function tryParse(text: string): { ok: true; value: unknown } | { ok: false } {
   try {
     return { ok: true, value: JSON.parse(text) }

@@ -11,6 +11,8 @@ import type {
   NamedVariable,
   Project,
   Run,
+  RunChatStatus,
+  RunChatView,
   RunDetails,
   RunStatus,
   RunSummary,
@@ -140,6 +142,16 @@ CREATE TABLE IF NOT EXISTS named_variable_versions (
   UNIQUE(variable_id, version)
 );
 
+CREATE TABLE IF NOT EXISTS run_chats (
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  chat_key TEXT NOT NULL,
+  branch_id TEXT NOT NULL DEFAULT '',
+  url TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'completed',
+  error TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (run_id, chat_key, branch_id)
+);
+
 CREATE TABLE IF NOT EXISTS user_actions (
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -161,6 +173,8 @@ export class AppDatabase {
     ensureColumn(db, 'branches', 'note', `TEXT NOT NULL DEFAULT ''`)
     ensureColumn(db, 'branches', 'note_alias', `TEXT NOT NULL DEFAULT ''`)
     ensureColumn(db, 'branches', 'batch', `INTEGER NOT NULL DEFAULT 0`)
+    ensureColumn(db, 'run_chats', 'status', `TEXT NOT NULL DEFAULT 'completed'`)
+    ensureColumn(db, 'run_chats', 'error', `TEXT NOT NULL DEFAULT ''`)
     return new AppDatabase(db)
   }
 
@@ -377,6 +391,47 @@ export class AppDatabase {
     this.run(`DELETE FROM runs WHERE id = ?`, runId)
   }
 
+  getRunChat(runId: string, chatKey: string, branchId: string): string | null {
+    const read = (id: string) =>
+      this.get<{ url: string }>(
+        `SELECT url FROM run_chats WHERE run_id = ? AND chat_key = ? AND branch_id = ?`,
+        runId,
+        chatKey,
+        id
+      )?.url || null
+    return read(branchId) || (branchId ? read('') : null)
+  }
+
+  saveRunChat(runId: string, chatKey: string, branchId: string, url: string): void {
+    this.run(
+      `INSERT INTO run_chats (run_id, chat_key, branch_id, url, status, error) VALUES (?, ?, ?, ?, 'completed', '')
+       ON CONFLICT(run_id, chat_key, branch_id) DO UPDATE SET url = excluded.url, status = 'completed', error = ''`,
+      runId,
+      chatKey,
+      branchId,
+      url
+    )
+  }
+
+  markRunChat(runId: string, chatKey: string, branchId: string, status: RunChatStatus, error: string): void {
+    this.run(
+      `INSERT INTO run_chats (run_id, chat_key, branch_id, url, status, error) VALUES (?, ?, ?, '', ?, ?)
+       ON CONFLICT(run_id, chat_key, branch_id) DO UPDATE SET status = excluded.status, error = excluded.error`,
+      runId,
+      chatKey,
+      branchId,
+      status,
+      error
+    )
+  }
+
+  listRunChats(runId: string): Array<{ chatKey: string; branchId: string; url: string; status: string; error: string }> {
+    return this.all(
+      `SELECT chat_key AS chatKey, branch_id AS branchId, url, status, error FROM run_chats WHERE run_id = ?`,
+      runId
+    )
+  }
+
   listRuns(projectId: string): RunSummary[] {
     return this.all<RunSummary>(
       `SELECT r.id, r.project_id AS projectId, r.workflow_id AS workflowId, w.name AS workflowName,
@@ -402,6 +457,8 @@ export class AppDatabase {
       runId
     )
     if (!row) throw new Error('Запуск не найден')
+    const graph = JSON.parse(row.snapshotJson) as WorkflowGraph
+    const branches = this.listBranches(runId)
     return {
       run: {
         id: row.id,
@@ -416,12 +473,13 @@ export class AppDatabase {
         createdAt: row.createdAt,
         updatedAt: row.updatedAt
       },
-      graph: JSON.parse(row.snapshotJson) as WorkflowGraph,
+      graph,
       versionNumber: row.versionNumber,
       workflowName: row.workflowName,
-      branches: this.listBranches(runId),
+      branches,
       executions: this.listExecutions(runId),
-      artifacts: this.listArtifacts(runId)
+      artifacts: this.listArtifacts(runId),
+      chats: chatViews(graph, branches, this.listRunChats(runId))
     }
   }
 
@@ -1209,6 +1267,36 @@ function mapBranch(row: BranchRow): Branch {
     noteAlias: row.noteAlias ?? '',
     status: row.status as Branch['status']
   }
+}
+
+function chatViews(
+  graph: WorkflowGraph,
+  branches: Branch[],
+  rows: Array<{ chatKey: string; branchId: string; url: string; status: string; error: string }>
+): RunChatView[] {
+  if ((graph.runtime ?? 'api') !== 'playwright') return []
+  return (graph.chats ?? []).map((chat) => {
+    const related = rows.filter((item) => item.chatKey === chat.key && (chat.scope === 'run' ? item.branchId === '' : item.branchId !== ''))
+    const error = related.find((item) => item.error)?.error || null
+    const opened = related.filter((item) => item.status === 'completed').length
+    const expected = chat.scope === 'branch' ? branches.length : 1
+    let status: RunChatStatus = 'pending'
+    if (related.some((item) => item.status === 'running')) status = 'running'
+    else if (related.some((item) => item.status === 'failed')) status = 'failed'
+    else if (expected > 0 && opened >= expected) status = 'completed'
+    const label = chat.scope === 'branch' ? (expected ? `${opened} из ${expected} веток` : 'в каждой ветке') : 'на запуск'
+    const addresses = related.filter((item) => item.url).map((item) => ({ branchId: item.branchId, url: item.url }))
+    return {
+      key: chat.key,
+      scope: chat.scope,
+      branchId: '',
+      label,
+      status,
+      url: addresses[0]?.url || null,
+      error,
+      addresses
+    }
+  })
 }
 
 function ensureColumn(db: DatabaseSync, table: string, column: string, definition: string): void {

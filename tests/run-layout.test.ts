@@ -36,7 +36,8 @@ function details(steps: StepDefinition[], branches: Branch[]): RunDetails {
     workflowName: 't',
     branches,
     executions: [],
-    artifacts: []
+    artifacts: [],
+    chats: []
   } as unknown as RunDetails
 }
 
@@ -200,6 +201,206 @@ describe('run layout', () => {
     assert.equal(first.y, second.y)
     assert.ok(second.x >= first.x + first.w)
     assert.ok(extra.y >= first.y + first.h)
+  })
+
+  it('draws one side branch from the concept item, not under each shot', () => {
+    const steps = [
+      step({
+        id: 'items',
+        key: 'items',
+        name: 'Элемент концепции',
+        type: 'fanout',
+        order: 1,
+        iterate: { over: '{{steps.prep.output}}', alias: 'concept', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'note',
+        key: 'note',
+        name: 'Комментарий',
+        type: 'manual',
+        order: 2,
+        dependsOn: ['items'],
+        config: { mode: 'text', prompt: '' }
+      }),
+      step({
+        id: 'shots',
+        key: 'shots',
+        name: 'Завершить шоты',
+        type: 'fanout',
+        order: 3,
+        dependsOn: ['note'],
+        iterate: { over: '{{steps.note.output}}', alias: 'shot', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'json',
+        key: 'json',
+        name: 'Формирование JSON по шоту',
+        type: 'transform',
+        order: 4,
+        dependsOn: ['shots'],
+        config: { mode: 'template', template: '' }
+      }),
+      step({
+        id: 'extra',
+        key: 'extra',
+        name: 'Дополнительные шоты — требования',
+        type: 'manual',
+        order: 9,
+        dependsOn: ['items'],
+        sideBranch: true,
+        config: { mode: 'text', prompt: '', allowEmpty: true }
+      }),
+      step({
+        id: 'extra_ai',
+        key: 'extra_ai',
+        name: 'Формирование дополнительных шотов',
+        type: 'transform',
+        order: 10,
+        dependsOn: ['extra'],
+        config: { mode: 'template', template: '' }
+      })
+    ]
+    const laid = layoutRun(
+      details(steps, [
+        branch({ id: 'c0', parentBranchId: '', sourceStepId: 'items', itemIndex: 0, label: 'Городская динамика' }),
+        branch({ id: 's0', parentBranchId: 'c0', sourceStepId: 'shots', itemIndex: 0, label: 'Общий' }),
+        branch({ id: 's1', parentBranchId: 'c0', sourceStepId: 'shots', itemIndex: 1, label: 'Деталь' })
+      ])
+    )
+    const concept = laid.nodes.find((node) => node.role === 'item' && node.branchId === 'c0')
+    const extras = laid.nodes.filter((node) => node.stepId === 'extra')
+    const extraAi = laid.nodes.filter((node) => node.stepId === 'extra_ai')
+    const json = laid.nodes.filter((node) => node.stepId === 'json')
+    assert.ok(concept)
+    assert.equal(extras.length, 1)
+    assert.equal(extraAi.length, 1)
+    assert.equal(extras[0].branchId, 'c0')
+    assert.equal(extraAi[0].branchId, 'c0')
+    assert.equal(json.length, 2)
+    assert.ok(json.every((node) => node.branchId === 's0' || node.branchId === 's1'))
+    assert.ok(laid.edges.some((edge) => edge.from === concept.id && edge.to === extras[0].id))
+    assert.ok(extras[0].x >= concept.x + concept.w)
+    assert.ok(extraAi[0].y > extras[0].y)
+    assert.equal(laid.frames.length, 1)
+    assert.equal(laid.frames[0].label, 'Доп. ветка')
+    assert.ok(laid.frames[0].x <= extras[0].x)
+    assert.ok(laid.frames[0].y <= extras[0].y)
+  })
+
+  it('keeps a side chain visible when it contains its own fanout', () => {
+    const steps = [
+      step({
+        id: 'items',
+        key: 'items',
+        name: 'Элемент концепции',
+        type: 'fanout',
+        order: 1,
+        iterate: { over: '{{steps.prep.output}}', alias: 'concept', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'shots',
+        key: 'shots',
+        name: 'Элемент шота',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['items'],
+        iterate: { over: '{{steps.items.output}}', alias: 'shot', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'json',
+        key: 'json',
+        name: 'Формирование JSON по шоту',
+        type: 'transform',
+        order: 3,
+        dependsOn: ['shots'],
+        config: { mode: 'template', template: '' }
+      }),
+      step({
+        id: 'extra',
+        key: 'extra',
+        name: 'Дополнительные шоты — требования',
+        type: 'manual',
+        order: 4,
+        dependsOn: ['items'],
+        sideBranch: true,
+        config: { mode: 'text', prompt: '', allowEmpty: true }
+      }),
+      step({
+        id: 'extra_list',
+        key: 'extra_list',
+        name: 'Разбор дополнительных шотов',
+        type: 'transform',
+        order: 5,
+        dependsOn: ['extra'],
+        config: { mode: 'template', template: '' }
+      }),
+      step({
+        id: 'extra_items',
+        key: 'extra_items',
+        name: 'Элементы дополнительных шотов',
+        type: 'fanout',
+        order: 6,
+        dependsOn: ['extra_list'],
+        iterate: { over: '{{steps.extra_list.output}}', alias: 'extra_shot', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'extra_json',
+        key: 'extra_json',
+        name: 'JSON-промпт дополнительного шота',
+        type: 'transform',
+        order: 7,
+        dependsOn: ['extra_items'],
+        config: { mode: 'template', template: '' }
+      })
+    ]
+    const laid = layoutRun(
+      details(steps, [
+        branch({ id: 'c0', parentBranchId: '', sourceStepId: 'items', itemIndex: 0, label: 'Городская динамика' }),
+        branch({ id: 's0', parentBranchId: 'c0', sourceStepId: 'shots', itemIndex: 0, label: 'Общий' })
+      ])
+    )
+    const concept = laid.nodes.find((node) => node.role === 'item' && node.branchId === 'c0')
+    const extra = laid.nodes.find((node) => node.stepId === 'extra')
+    const extraFan = laid.nodes.find((node) => node.stepId === 'extra_items')
+    assert.ok(concept && extra && extraFan)
+    assert.equal(extra.branchId, 'c0')
+    assert.equal(extraFan.branchId, 'c0')
+    assert.equal(laid.nodes.filter((node) => node.stepId === 'extra').length, 1)
+    assert.ok(laid.edges.some((edge) => edge.from === concept.id && edge.to === extra.id))
+    assert.ok(extra.x >= concept.x + concept.w)
+  })
+
+  it('places chat presets above the first step', () => {
+    const steps = [step({ id: 'ask', key: 'ask', type: 'ai', config: { provider: 'qwen', model: 'qwen', messages: [], outputFormat: 'text' } })]
+    const laid = layoutRun({
+      ...details(steps, []),
+      graph: {
+        runtime: 'playwright',
+        inputs: [],
+        steps,
+        chats: [
+          { key: 'analyst', instruction: 'смотри', scope: 'run' },
+          { key: 'shots', instruction: 'кадр', scope: 'branch' }
+        ]
+      },
+      chats: [
+        { key: 'analyst', scope: 'run', branchId: '', label: 'на запуск', status: 'completed', url: 'https://chat.qwen.ai/c/abc', error: null },
+        { key: 'shots', scope: 'branch', branchId: '', label: '1 из 2 веток', status: 'running', url: null, error: null }
+      ]
+    })
+    const analyst = laid.nodes.find((node) => node.role === 'chat' && node.title === 'analyst')
+    const shots = laid.nodes.find((node) => node.role === 'chat' && node.title === 'shots')
+    const ask = laid.nodes.find((node) => node.stepId === 'ask')
+    assert.ok(analyst && shots && ask)
+    assert.equal(analyst.status, 'completed')
+    assert.equal(shots.status, 'running')
+    assert.ok(analyst.y + analyst.h < ask.y)
+    assert.ok(laid.edges.some((edge) => edge.from === analyst.id && edge.to === `step:ask:`))
   })
 
   it('grows a node so the full title fits', () => {

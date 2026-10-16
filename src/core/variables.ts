@@ -120,6 +120,15 @@ function isDirective(inner: string): boolean {
   return inner === '/if' || inner.startsWith('#') || inner.startsWith('/')
 }
 
+export function messageAllowed(when: { op: 'and' | 'or'; paths: string[] } | undefined, ctx: VariableContext): boolean {
+  if (!when || when.paths.length === 0) return true
+  const present = when.paths.map((path) => {
+    const resolved = resolvePath(path, ctx)
+    return resolved.ok && isPresent(resolved.value)
+  })
+  return when.op === 'or' ? present.some(Boolean) : present.every(Boolean)
+}
+
 export function isPresent(value: unknown): boolean {
   if (value == null) return false
   if (typeof value === 'string') return value.trim() !== ''
@@ -197,12 +206,28 @@ export function validateWorkflowTemplates(graph: WorkflowGraph): string[] {
       errors.push(`Фрагмент «${snippet.key}»: ${issue}`)
     }
   }
+  for (const chat of graph.chats ?? []) {
+    for (const issue of validateTemplate(chat.instruction)) {
+      errors.push(`Чат «${chat.key}»: ${issue}`)
+    }
+  }
   for (const step of graph.steps) {
     if (step.use) continue
     for (const template of templatesInStep(step, graph.steps)) {
       for (const issue of validateTemplate(template)) {
         errors.push(`Шаг «${step.name}»: ${issue}`)
       }
+    }
+    if (step.type === 'ai') {
+      step.config.messages.forEach((message, index) => {
+        if (!message.when) return
+        if (!message.when.paths.length) {
+          errors.push(`Шаг «${step.name}»: у сообщения ${index + 1} условие без переменных`)
+        }
+        for (const path of message.when.paths) {
+          if (!parsePath(path)) errors.push(`Шаг «${step.name}»: некорректный путь «${path}» в условии сообщения ${index + 1}`)
+        }
+      })
     }
   }
   return errors

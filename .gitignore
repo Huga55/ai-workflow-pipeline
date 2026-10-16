@@ -6,3 +6,4 @@ dist
 *.local
 .vite
 dist-types
+.qwen-profile

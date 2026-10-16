@@ -8,6 +8,8 @@ import { registerIpc } from './ipc'
 import { SecretStore } from './secrets'
 import { AppService } from './service'
 
+let service: AppService | null = null
+
 protocol.registerSchemesAsPrivileged([
   {
     scheme: 'pipeline',
@@ -88,7 +90,7 @@ app.whenReady().then(() => {
   mkdirSync(mediaDir, { recursive: true })
   const database = AppDatabase.open(path.join(userData, 'pipeline.sqlite'))
   const secrets = new SecretStore(path.join(userData, 'secrets.bin'))
-  const service = new AppService(database, secrets, mediaDir, (runId) => {
+  service = new AppService(database, secrets, mediaDir, (runId) => {
     window?.webContents.send('run:updated', runId)
   })
   registerIpc(service, () => window)
@@ -112,4 +114,8 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   app.quit()
+})
+
+app.on('will-quit', () => {
+  void service?.closeBrowser()
 })

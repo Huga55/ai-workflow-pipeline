@@ -1,3 +1,4 @@
+import { sideChains } from '@core/side-branch'
 import { effectiveStep } from '@core/step-ref'
 import type { StepDefinition, WorkflowGraph } from '@core/types'
 import { validateWorkflowTemplates } from '@core/variables'
@@ -43,6 +44,8 @@ export function fanoutInnerSteps(stepId: string, steps: StepDefinition[]): StepD
   if (!fanout || fanout.type !== 'fanout') return dependents
   const upstream = ancestorIds(stepId, steps)
   const owned = new Set(dependents.map((step) => step.id))
+  const chains = sideChains(steps)
+  const sideIds = new Set(chains.flatMap((chain) => chain.stepIds))
   const ordered = [...steps].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name))
   let after = false
   for (const step of ordered) {
@@ -50,12 +53,17 @@ export function fanoutInnerSteps(stepId: string, steps: StepDefinition[]): StepD
       after = true
       continue
     }
-    if (!after || upstream.has(step.id) || owned.has(step.id)) continue
+    if (!after || upstream.has(step.id) || owned.has(step.id) || sideIds.has(step.id)) continue
     if (step.type === 'merge' && step.config.mode === 'collect') {
       const targetId = step.config.fromFanoutStepId
       if (targetId === stepId || upstream.has(targetId)) break
     }
     owned.add(step.id)
+  }
+  for (const chain of chains) {
+    const belongs = chain.anchorId === stepId || (chain.anchorId != null && owned.has(chain.anchorId))
+    if (!belongs) continue
+    for (const id of chain.stepIds) owned.add(id)
   }
   return steps.filter((step) => owned.has(step.id))
 }
@@ -206,6 +214,18 @@ export function validateGraph(graph: WorkflowGraph): string[] {
     if (snippetKeys.has(snippet.key)) errors.push(`Повторяется ключ фрагмента «${snippet.key}»`)
     snippetKeys.add(snippet.key)
   }
+  const runtime = graph.runtime ?? 'api'
+  const chatKeys = new Set<string>()
+  for (const chat of graph.chats ?? []) {
+    if (!KEY.test(chat.key)) errors.push(`Некорректный ключ чата «${chat.key}»`)
+    if (chatKeys.has(chat.key)) errors.push(`Повторяется ключ чата «${chat.key}»`)
+    chatKeys.add(chat.key)
+    if (chat.scope !== 'run' && chat.scope !== 'branch') errors.push(`У чата «${chat.key}» неизвестная область`)
+    if (!chat.instruction.trim()) errors.push(`У чата «${chat.key}» пустая инструкция`)
+  }
+  if (runtime === 'api' && (graph.chats?.length ?? 0) > 0) {
+    errors.push('Чаты задаются только когда основа workflow — playwright')
+  }
   const keys = new Set<string>()
   const ids = new Set(graph.steps.map((step) => step.id))
   for (const step of graph.steps) {
@@ -236,6 +256,17 @@ export function validateGraph(graph: WorkflowGraph): string[] {
     }
     if (resolved.type === 'ai' && resolved.config.outputFormat === 'json' && resolved.config.jsonSchema) {
       if (typeof resolved.config.jsonSchema !== 'object') errors.push(`JSON Schema шага «${step.name}» должна быть объектом`)
+    }
+    if (resolved.type === 'ai' && !step.use) {
+      if (runtime === 'playwright') {
+        if (!resolved.config.chat) errors.push(`Шаг «${step.name}» не указывает чат`)
+        else if (!chatKeys.has(resolved.config.chat)) errors.push(`Шаг «${step.name}» ссылается на неизвестный чат «${resolved.config.chat}»`)
+        if (resolved.config.messages.some((message) => message.role !== 'user')) {
+          errors.push(`Шаг «${step.name}»: в playwright-чате сообщение только с ролью user. Инструкция живёт в чате.`)
+        }
+      } else if (resolved.config.chat) {
+        errors.push(`Шаг «${step.name}» указывает чат, но основа workflow — api`)
+      }
     }
     if (resolved.type === 'merge' && resolved.config.mode === 'collect') {
       if (!step.dependsOn.includes(resolved.config.fromFanoutStepId)) {

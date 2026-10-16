@@ -398,6 +398,42 @@ function InputControl({
   )
 }
 
+function chatIdFromUrl(url: string | null | undefined): string | null {
+  if (!url) return null
+  const match = url.match(/\/c\/([A-Za-z0-9-]{8,})\/?(?:[?#].*)?$/)
+  if (!match || match[1] === 'guest') return null
+  return match[1]
+}
+
+function ChatHashes({ chat }: { chat: RunDetails['chats'][number] | undefined }) {
+  const rows = (chat?.addresses ?? []).filter((item) => item.url)
+  if (!rows.length && chat?.url) rows.push({ branchId: '', url: chat.url })
+  if (!rows.length) return <p className="meta">Адрес ещё не сохранён.</p>
+  return (
+    <>
+      {rows.map((item) => (
+        <p className="meta" key={`${item.branchId}:${item.url}`}>
+          Хэш · {chatIdFromUrl(item.url) ?? item.url}
+        </p>
+      ))}
+    </>
+  )
+}
+
+function ChatHashLine({ details, chatKey, branchId }: { details: RunDetails; chatKey: string; branchId: string }) {
+  const chat = (details.chats ?? []).find((item) => item.key === chatKey)
+  if (!chat) return <p className="meta">Чат «{chatKey}» в этой версии схемы не задан.</p>
+  const rows = chat.addresses ?? []
+  const row = chat.scope === 'branch' ? rows.find((item) => item.branchId === branchId) : rows.find((item) => item.branchId === '')
+  const hash = chatIdFromUrl(row?.url ?? (chat.scope === 'run' ? chat.url : null))
+  const place = chat.scope === 'branch' ? 'в этой ветке' : 'на весь запуск'
+  return (
+    <p className="meta">
+      Чат {chatKey} · {place} · {hash ?? 'адрес не сохранён'}
+    </p>
+  )
+}
+
 function CanvasDock({
   details,
   node,
@@ -421,6 +457,21 @@ function CanvasDock({
       <aside className="canvas-dock">
         <p className="lede">Холст запуска. Цепочка идёт сверху вниз, элементы одного ветвления стоят в ряд.</p>
         <p className="meta">Выберите шаг. Колесо меняет масштаб, пустое место можно перетаскивать.</p>
+      </aside>
+    )
+  }
+  if (node.role === 'chat') {
+    const chat = (details.chats ?? []).find((item) => item.key === node.title && item.branchId === node.branchId)
+    return (
+      <aside className="canvas-dock">
+        <div className="row">
+          <strong>{node.title}</strong>
+          <StatusPill status={chat?.status ?? node.status} />
+        </div>
+        <p className="meta">{chat?.scope === 'branch' ? 'Чат создаётся в каждой ветке.' : 'Чат создаётся один раз на запуск.'}</p>
+        <p className="meta">{chat?.label}</p>
+        {chat?.error && <div className="error">{chat.error}</div>}
+        <ChatHashes chat={chat} />
       </aside>
     )
   }
@@ -511,6 +562,7 @@ function ExecutionCard({
           <strong>{step.name}</strong>
           <StatusPill status="pending" />
         </header>
+        {step.type === 'ai' && step.config.chat && <ChatHashLine details={details} chatKey={step.config.chat} branchId={branchId} />}
         <RunActions details={details} step={step} branchId={branchId} busy={busy} act={act} />
       </article>
     )
@@ -522,10 +574,12 @@ function ExecutionCard({
         <strong>{step.name}</strong>
         <StatusPill status={execution.status} />
       </header>
+      {step.type === 'ai' && step.config.chat && <ChatHashLine details={details} chatKey={step.config.chat} branchId={branchId} />}
       <p className="meta">
         Попытка {execution.attempt}
         {execution.durationMs != null ? ` · ${execution.durationMs} мс` : ''}
         {execution.meta.provider ? ` · ${execution.meta.provider} / ${execution.meta.model ?? ''}` : ''}
+        {execution.meta.repairedJson ? ' · JSON починен из сырого ответа' : ''}
       </p>
       {attempts.length > 1 && (
         <div className="attempts">
@@ -603,6 +657,7 @@ function RunActions({
     .filter((item) => item.stepId === step.id && item.branchId === branchId && !item.meta.fanoutError)
     .sort((a, b) => b.attempt - a.attempt)[0]
   const canSkip = !latest || (latest.status !== 'completed' && latest.status !== 'skipped' && latest.status !== 'running' && latest.status !== 'waiting_for_user')
+  const canRepair = latest?.status === 'failed' && Boolean(latest.rawResponse) && (latest.error ?? '').includes('корректный JSON')
   const chain = chainStepIds(step.id, details.graph.steps)
   const canAppend = details.graph.steps.some((item) => item.iterate && chain.has(item.id))
   const forcedAppend = details.graph.steps.some((item) => item.iterate?.appendOnRerun && chain.has(item.id))
@@ -622,8 +677,35 @@ function RunActions({
           Новый ряд
         </label>
       )}
-      {canAppend && forcedAppend && <p className="field-note">В схеме шага включено «каждый повтор — новый ряд»: элементы добавятся следующим рядом.</p>}
-      {canAppend && !forcedAppend && <p className="field-note">Если элементов столько же, они добавятся следующим рядом и не заменят текущие.</p>}
+      {canAppend && forcedAppend && <p className="field-note">В схеме включён новый ряд. Такой же массив повторно ряд не создаёт.</p>}
+      {canAppend && !forcedAppend && <p className="field-note">Галочка добавляет другой массив следующим рядом. Совпадающий ряд не копируется.</p>}
+      {canRepair && (
+        <>
+          <p className="field-note">
+            Починить JSON берёт уже полученный ответ и экранирует кавычки внутри строк. Модель заново не вызывается. Если поломка
+            другая, шаг останется с ошибкой.
+          </p>
+          <div className="row">
+            <button
+              className="btn"
+              type="button"
+              disabled={busy}
+              onClick={() =>
+                void act(() => {
+                  if (typeof window.pipeline.repairStepJson !== 'function') {
+                    return Promise.reject(
+                      new Error('Закройте приложение полностью и запустите снова. Обновление окна эту кнопку не подключает.')
+                    )
+                  }
+                  return window.pipeline.repairStepJson(details.run.id, step.id, branchId)
+                })
+              }
+            >
+              Починить JSON
+            </button>
+          </div>
+        </>
+      )}
       <div className="row">
         <button className="btn" type="button" disabled={busy} onClick={() => void act(() => runAgain('only'))}>
           Только этот шаг

@@ -19,6 +19,8 @@ export type StepRunContext = {
   step: StepDefinition
   ctx: VariableContext
   graph: WorkflowGraph
+  runId: string
+  branchId: string
   signal?: AbortSignal
   collectOutputs?: (fanoutStepId: string, fromStepId: string) => unknown[]
 }
@@ -46,7 +48,15 @@ export function createRunners(deps: RunnerDeps = {}): Record<StepDefinition['typ
           if (!deps.providerFor) throw new Error('AI-провайдер не настроен')
           return deps.providerFor(request.provider).generate(request, signal)
         })
-      return runAiStep(ctx.step.config, ctx.ctx, generate, ctx.signal)
+      const runtime = ctx.graph.runtime ?? 'api'
+      const config = ctx.step.config
+      const chat = ctx.graph.chats?.find((item) => item.key === config.chat)
+      const branchId = runtime === 'playwright' && chat?.scope !== 'branch' ? '' : ctx.branchId
+      return runAiStep(config, ctx.ctx, generate, ctx.signal, {
+        runtime,
+        runId: ctx.runId,
+        branchId
+      })
     }
   }
 }

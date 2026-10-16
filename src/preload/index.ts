@@ -29,6 +29,7 @@ const api: PipelineApi = {
   retryStep: (runId, stepId, branchId) => ipcRenderer.invoke('retryStep', runId, stepId, branchId),
   runStep: (runId, stepId, branchId, mode, options) => ipcRenderer.invoke('runStep', runId, stepId, branchId, mode, options),
   skipStep: (runId, stepId, branchId) => ipcRenderer.invoke('skipStep', runId, stepId, branchId),
+  repairStepJson: (runId, stepId, branchId) => ipcRenderer.invoke('repairStepJson', runId, stepId, branchId),
   listVariables: (scope, projectId) => ipcRenderer.invoke('listVariables', scope, projectId),
   saveVariable: (input) => ipcRenderer.invoke('saveVariable', input),
   updateVariable: (input) => ipcRenderer.invoke('updateVariable', input),
@@ -42,6 +43,10 @@ const api: PipelineApi = {
   getProviderStatus: () => ipcRenderer.invoke('getProviderStatus'),
   setProviderKey: (providerId, apiKey) => ipcRenderer.invoke('setProviderKey', providerId, apiKey),
   clearProviderKey: (providerId) => ipcRenderer.invoke('clearProviderKey', providerId),
+  connectQwen: () => ipcRenderer.invoke('connectQwen'),
+  qwenTokenStatus: () => ipcRenderer.invoke('qwenTokenStatus'),
+  setQwenSession: (input) => ipcRenderer.invoke('setQwenSession', input),
+  clearQwenSession: () => ipcRenderer.invoke('clearQwenSession'),
   onRunUpdated: (callback) => {
     const listener = (_event: IpcRendererEvent, runId: string) => callback(runId)
     ipcRenderer.on('run:updated', listener)

@@ -63,19 +63,38 @@ export type InputDefinition = {
   options?: string[]
 }
 
+export type MessageWhen = {
+  op: 'and' | 'or'
+  paths: string[]
+}
+
 export type AIMessageDraft = {
   id: string
   role: 'system' | 'user' | 'assistant'
   content: string
+  /** Сообщение уходит целиком только если переменные заполнены. Без поля уходит всегда. */
+  when?: MessageWhen
 }
+
+export type BranchLaunch = 'all' | 'sequence' | 'manual'
 
 export type IterateConfig = {
   over: string
   alias: string
-  launch: 'all' | 'manual'
+  launch: BranchLaunch
   noteAlias?: string
   /** Если true, повторный запуск всегда добавляет новый ряд веток, а не обновляет текущие на месте. */
   appendOnRerun?: boolean
+}
+
+export type WorkflowRuntime = 'api' | 'playwright'
+
+export type WorkflowChatScope = 'run' | 'branch'
+
+export type WorkflowChat = {
+  key: string
+  instruction: string
+  scope: WorkflowChatScope
 }
 
 export type WorkflowSnippet = {
@@ -91,6 +110,8 @@ export type AIStepConfig = {
   messages: AIMessageDraft[]
   outputFormat: 'text' | 'json'
   jsonSchema?: unknown
+  /** Имя чата из graph.chats. Имеет смысл при runtime playwright. */
+  chat?: string
 }
 
 export type TransformStepConfig = {
@@ -166,7 +187,7 @@ type StepBase = {
   iterate: IterateConfig | null
   /** Ключ другого шага: type и config берутся от него, свои только положение, зависимости и ветвление. */
   use?: string
-  /** Доп. ветка в схеме: рисуется рамкой под точкой крепления, не в основной колонке. */
+  /** Доп. ветка: рамка у шага-опоры. В запуске одна цепочка от него, вложенные ветки её не копируют. */
   sideBranch?: boolean
 }
 
@@ -182,9 +203,13 @@ export type StepDefinition = StepBase &
   )
 
 export type WorkflowGraph = {
+  /** Нет поля — это api. Playwright-workflow заводит чаты заранее и пишет в них из шагов. */
+  runtime?: WorkflowRuntime
   inputs: InputDefinition[]
   /** Переиспользуемые куски текста для промптов: {{snippets.ключ}} */
   snippets?: WorkflowSnippet[]
+  /** Преднастройка чатов. Только для runtime playwright. */
+  chats?: WorkflowChat[]
   steps: StepDefinition[]
 }
 
@@ -295,6 +320,7 @@ export type ExecutionMeta = {
   usage?: unknown
   model?: string
   provider?: string
+  repairedJson?: boolean
 }
 
 export type StepOutcome = {
@@ -344,6 +370,20 @@ export type UserAction = {
   createdAt: string
 }
 
+export type RunChatStatus = 'pending' | 'running' | 'completed' | 'failed'
+
+export type RunChatView = {
+  key: string
+  scope: WorkflowChatScope
+  branchId: string
+  label: string
+  status: RunChatStatus
+  url: string | null
+  error: string | null
+  /** Адрес каждого уже открытого чата: пустой branchId — чат на весь запуск. */
+  addresses?: { branchId: string; url: string }[]
+}
+
 export type RunDetails = {
   run: Run
   graph: WorkflowGraph
@@ -352,6 +392,7 @@ export type RunDetails = {
   branches: Branch[]
   executions: StepExecution[]
   artifacts: Artifact[]
+  chats: RunChatView[]
 }
 
 export type UserActionPayload =
@@ -375,6 +416,10 @@ export type AIRequest = {
   maxTokens?: number
   outputFormat: 'text' | 'json'
   jsonSchema?: unknown
+  runtime?: WorkflowRuntime
+  chat?: string
+  runId?: string
+  branchId?: string
 }
 
 export type AIResponse = {

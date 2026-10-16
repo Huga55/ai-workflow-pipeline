@@ -12,10 +12,12 @@ import type {
   ManualMode,
   ManualStepConfig,
   MergeStepConfig,
+  MessageWhen,
   ParseStepConfig,
   StepDefinition,
   StepType,
   TransformStepConfig,
+  WorkflowChat,
   WorkflowGraph,
   WorkflowSnippet
 } from '@core/types'
@@ -61,10 +63,12 @@ export type WorkflowJsonResult = { ok: true; document: WorkflowJsonDocument } | 
 export function formatWorkflowJson(document: WorkflowJsonDocument): string {
   const payload: Record<string, unknown> = {
     name: document.name,
-    description: document.description,
-    inputs: document.graph.inputs
+    description: document.description
   }
+  if (document.graph.runtime === 'playwright') payload.runtime = 'playwright'
+  payload.inputs = document.graph.inputs
   if (document.graph.snippets?.length) payload.snippets = document.graph.snippets
+  if (document.graph.chats?.length) payload.chats = document.graph.chats
   payload.steps = document.graph.steps.map(formatStep)
   return JSON.stringify(payload, null, 2)
 }
@@ -106,12 +110,14 @@ export function parseWorkflowJson(text: string, options: WorkflowJsonParseOption
   if (!isRecord(raw)) return { ok: false, errors: ['Корень JSON должен быть объектом с полями name, description, inputs и steps'] }
 
   const errors: string[] = []
-  onlyKeys(raw, ['name', 'description', 'inputs', 'snippets', 'steps'], 'корень', errors)
+  onlyKeys(raw, ['name', 'description', 'runtime', 'inputs', 'snippets', 'chats', 'steps'], 'корень', errors)
   const name = readString(raw, 'name', 'name', errors, '') ?? ''
   const description = readString(raw, 'description', 'description', errors, '') ?? ''
   if (!Array.isArray(raw.inputs)) errors.push('inputs должен быть массивом')
   if (!Array.isArray(raw.steps)) errors.push('steps должен быть массивом')
   if ('snippets' in raw && !Array.isArray(raw.snippets)) errors.push('snippets должен быть массивом')
+  if ('chats' in raw && !Array.isArray(raw.chats)) errors.push('chats должен быть массивом')
+  const runtime = readEnum(raw, 'runtime', 'runtime', new Set(['api', 'playwright'] as const), errors, 'api')
   if (!Array.isArray(raw.inputs) || !Array.isArray(raw.steps)) return { ok: false, errors }
 
   const session: ParseSession = {
@@ -137,6 +143,15 @@ export function parseWorkflowJson(text: string, options: WorkflowJsonParseOption
     })
   }
 
+  const chats: WorkflowChat[] = []
+  const takenChatKeys = new Set<string>()
+  if (Array.isArray(raw.chats)) {
+    raw.chats.forEach((item, index) => {
+      const chat = parseChat(item, index, takenChatKeys, errors)
+      if (chat) chats.push(chat)
+    })
+  }
+
   const takenKeys = new Set<string>()
   const pending: PendingStep[] = []
   raw.steps.forEach((item, index) => {
@@ -151,10 +166,36 @@ export function parseWorkflowJson(text: string, options: WorkflowJsonParseOption
   applyUseLinks(steps, errors)
   if (errors.length) return { ok: false, errors }
 
-  const graph = { inputs, ...(snippets.length ? { snippets } : {}), steps }
+  const graph = {
+    ...(runtime === 'playwright' ? { runtime: 'playwright' as const } : {}),
+    inputs,
+    ...(snippets.length ? { snippets } : {}),
+    ...(chats.length ? { chats } : {}),
+    steps
+  }
   const issues = validateGraph(graph)
   if (issues.length) return { ok: false, errors: issues }
   return { ok: true, document: { name, description, graph } }
+}
+
+function parseChat(raw: unknown, index: number, taken: Set<string>, errors: string[]): WorkflowChat | null {
+  const path = `chats[${index}]`
+  if (!isRecord(raw)) {
+    errors.push(`${path} должен быть объектом`)
+    return null
+  }
+  onlyKeys(raw, ['key', 'instruction', 'scope'], path, errors)
+  const key = readString(raw, 'key', `${path}.key`, errors)
+  const instruction = readString(raw, 'instruction', `${path}.instruction`, errors, '')
+  const scope = readEnum(raw, 'scope', `${path}.scope`, new Set(['run', 'branch'] as const), errors, 'run')
+  if (!key || instruction === undefined || !scope) return null
+  if (!key.trim()) {
+    errors.push(`${path}.key: укажите ключ`)
+    return null
+  }
+  if (taken.has(key)) errors.push(`${path}: повторяется ключ «${key}»`)
+  taken.add(key)
+  return { key, instruction, scope }
 }
 
 function parseSnippet(raw: unknown, index: number, taken: Set<string>, errors: string[]): WorkflowSnippet | null {
@@ -373,7 +414,7 @@ function parseAiConfig(
 ): AIStepConfig | null {
   const errors = session.errors
   const previousMessages = previousStep?.type === 'ai' ? previousStep.config.messages : []
-  onlyKeys(raw, ['provider', 'model', 'temperature', 'maxTokens', 'messages', 'outputFormat', 'jsonSchema'], path, errors)
+  onlyKeys(raw, ['provider', 'model', 'temperature', 'maxTokens', 'messages', 'outputFormat', 'jsonSchema', 'chat'], path, errors)
   const provider = readString(raw, 'provider', `${path}.provider`, errors, 'openai')
   const model = readString(raw, 'model', `${path}.model`, errors)
   const outputFormat = readEnum(raw, 'outputFormat', `${path}.outputFormat`, new Set(['text', 'json'] as const), errors, 'json')
@@ -391,14 +432,15 @@ function parseAiConfig(
       errors.push(`${messagePath} должен быть объектом`)
       return
     }
-    onlyKeys(item, ['id', 'role', 'content'], messagePath, errors)
+    onlyKeys(item, ['id', 'role', 'content', 'when'], messagePath, errors)
     const role = readEnum(item, 'role', `${messagePath}.role`, ROLES, errors)
     const content = readString(item, 'content', `${messagePath}.content`, errors, '')
     if (!role || content === undefined) return
     const id = assignId(readString(item, 'id', `${messagePath}.id`, errors), previousMessages[index]?.id, messagePath, session)
     if (seen.has(id)) errors.push(`${messagePath}: повторяется id «${id}»`)
     seen.add(id)
-    messages.push({ id, role, content })
+    const when = parseMessageWhen(item.when, `${messagePath}.when`, errors)
+    messages.push(when ? { id, role, content, when } : { id, role, content })
   })
   if (!provider || !model || !outputFormat) return null
   const config: AIStepConfig = { provider, model, messages, outputFormat }
@@ -407,7 +449,33 @@ function parseAiConfig(
   if ('temperature' in raw) config.temperature = temperature
   if ('maxTokens' in raw) config.maxTokens = maxTokens
   if ('jsonSchema' in raw) config.jsonSchema = raw.jsonSchema
+  const chat = readString(raw, 'chat', `${path}.chat`, errors)
+  if (chat?.trim()) config.chat = chat.trim()
   return config
+}
+
+function parseMessageWhen(raw: unknown, path: string, errors: string[]): MessageWhen | undefined {
+  if (raw === undefined) return undefined
+  if (!isRecord(raw)) {
+    errors.push(`${path} должен быть объектом`)
+    return undefined
+  }
+  onlyKeys(raw, ['op', 'paths'], path, errors)
+  const op = readEnum(raw, 'op', `${path}.op`, new Set(['and', 'or'] as const), errors)
+  if (!Array.isArray(raw.paths)) {
+    errors.push(`${path}.paths должен быть массивом`)
+    return undefined
+  }
+  const paths: string[] = []
+  raw.paths.forEach((item, index) => {
+    if (typeof item !== 'string') {
+      errors.push(`${path}.paths[${index}] должен быть строкой`)
+      return
+    }
+    paths.push(item.trim())
+  })
+  if (!op) return undefined
+  return { op, paths }
 }
 
 function parseTransformConfig(raw: Record<string, unknown>, path: string, errors: string[]): TransformStepConfig | null {
@@ -535,7 +603,7 @@ function readIterate(raw: Record<string, unknown>, path: string, type: StepType 
   onlyKeys(raw.iterate, ['over', 'alias', 'launch', 'noteAlias', 'appendOnRerun'], iteratePath, errors)
   const over = readString(raw.iterate, 'over', `${iteratePath}.over`, errors, '')
   const alias = readString(raw.iterate, 'alias', `${iteratePath}.alias`, errors, 'item')
-  const launch = readEnum(raw.iterate, 'launch', `${iteratePath}.launch`, new Set(['all', 'manual'] as const), errors, 'all')
+  const launch = readEnum(raw.iterate, 'launch', `${iteratePath}.launch`, new Set(['all', 'sequence', 'manual'] as const), errors, 'all')
   if (over === undefined || alias === undefined || !launch) return undefined
   const iterate: IterateConfig = { over, alias, launch }
   if ('noteAlias' in raw.iterate) {

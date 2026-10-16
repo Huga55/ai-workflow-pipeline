@@ -91,6 +91,14 @@ export function RunCanvas({
       </div>
       <div className="canvas-world" style={{ width: worldW, height: worldH, transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})` }}>
         <svg className="canvas-edges" width={worldW} height={worldH}>
+          {layout.frames.map((frame) => (
+            <g key={frame.id}>
+              <rect className="canvas-frame" x={frame.x} y={frame.y} width={frame.w} height={frame.h} rx={12} />
+              <text className="canvas-frame-label" x={frame.x + 12} y={frame.y + 16}>
+                {frame.label}
+              </text>
+            </g>
+          ))}
           {layout.edges.map((edge) => {
             const from = layout.nodes.find((node) => node.id === edge.from)
             const to = layout.nodes.find((node) => node.id === edge.to)
@@ -126,12 +134,21 @@ export function branchOf(details: RunDetails, node: CanvasNode): Branch | undefi
 }
 
 function edgePath(from: CanvasNode, to: CanvasNode): string {
-  const x1 = from.x + from.w / 2
-  const y1 = from.y + from.h
-  const x2 = to.x + to.w / 2
-  const y2 = to.y
-  const mid = (y1 + y2) / 2
-  return `M ${x1} ${y1} C ${x1} ${mid}, ${x2} ${mid}, ${x2} ${y2}`
+  const downX = from.x + from.w / 2
+  const downY = from.y + from.h
+  const topX = to.x + to.w / 2
+  const topY = to.y
+  const sideBySide = topY < downY - 8 && to.x >= from.x + from.w - 8
+  if (sideBySide) {
+    const x1 = from.x + from.w
+    const y1 = from.y + from.h / 2
+    const x2 = to.x
+    const y2 = to.y + to.h / 2
+    const mid = (x1 + x2) / 2
+    return `M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`
+  }
+  const mid = (downY + topY) / 2
+  return `M ${downX} ${downY} C ${downX} ${mid}, ${topX} ${mid}, ${topX} ${topY}`
 }
 
 function clamp(value: number, min: number, max: number): number {

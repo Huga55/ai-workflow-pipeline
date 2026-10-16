@@ -1,4 +1,5 @@
 import { topoSort } from '@core/graph'
+import { sideChains } from '@core/side-branch'
 import type { StepDefinition } from '@core/types'
 
 export type BuilderSideBranch = {
@@ -18,33 +19,24 @@ export type BuilderFlowLayout = {
 
 /** Цепочка доп. ветки: корень с sideBranch и шаги, у которых все зависимости уже внутри этой цепочки. */
 export function sideBranchChain(root: StepDefinition, steps: StepDefinition[]): StepDefinition[] {
-  const owned = new Set<string>([root.id])
-  let grew = true
-  while (grew) {
-    grew = false
-    for (const step of steps) {
-      if (owned.has(step.id) || step.sideBranch) continue
-      if (!step.dependsOn.length) continue
-      if (step.dependsOn.every((dep) => owned.has(dep))) {
-        owned.add(step.id)
-        grew = true
-      }
-    }
-  }
-  const chain = steps.filter((step) => owned.has(step.id))
-  const sorted = topoSort(chain)
-  return sorted.ok ? sorted.steps : [...chain].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name))
+  const chain = sideChains(steps).find((item) => item.rootId === root.id)
+  const ids = new Set(chain?.stepIds ?? [root.id])
+  const owned = steps.filter((step) => ids.has(step.id))
+  const sorted = topoSort(owned)
+  return sorted.ok ? sorted.steps : [...owned].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name))
 }
 
 export function builderFlowLayout(steps: StepDefinition[]): BuilderFlowLayout {
   const roots = steps.filter((step) => step.sideBranch)
+  const found = sideChains(steps)
   const chains = new Map<string, StepDefinition[]>()
   const claimed = new Set<string>()
-  for (const root of roots) {
-    if (claimed.has(root.id)) continue
-    const chain = sideBranchChain(root, steps)
-    for (const step of chain) claimed.add(step.id)
-    chains.set(root.id, chain)
+  for (const chain of found) {
+    const root = steps.find((step) => step.id === chain.rootId)
+    if (!root) continue
+    const stepsInChain = sideBranchChain(root, steps)
+    for (const step of stepsInChain) claimed.add(step.id)
+    chains.set(chain.rootId, stepsInChain)
   }
 
   const main = steps.filter((step) => !claimed.has(step.id))

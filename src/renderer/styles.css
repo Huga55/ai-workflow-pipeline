@@ -239,6 +239,8 @@ textarea.json-editor:focus { border-color: var(--brass-deep); }
 .canvas-world { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
 .canvas-edges { position: absolute; inset: 0; pointer-events: none; }
 .canvas-edges path { fill: none; stroke: #8c7354; stroke-width: 1.5; }
+.canvas-frame { fill: rgba(226, 164, 90, 0.06); stroke: #c4a574; stroke-width: 1.25; stroke-dasharray: 5 4; }
+.canvas-frame-label { fill: #e2a45a; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; font-family: var(--sans); }
 .canvas-node {
   position: absolute;
   box-sizing: border-box;

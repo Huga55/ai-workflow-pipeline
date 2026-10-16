@@ -162,6 +162,10 @@ function Settings({ onClose }: { onClose: () => void }) {
   const [status, setStatus] = useState<ProviderStatus | null>(null)
   const [key, setKey] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const [qwen, setQwen] = useState<'unknown' | 'checking' | 'in' | 'out'>('unknown')
+  const [qwenToken, setQwenToken] = useState('')
+  const [qwenRefresh, setQwenRefresh] = useState('')
+  const [qwenSaved, setQwenSaved] = useState({ token: false, refreshToken: false })
 
   async function reload() {
     setStatus(await window.pipeline.getProviderStatus())
@@ -169,6 +173,10 @@ function Settings({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     void reload().catch((reason) => setError(errorText(reason)))
+    void window.pipeline
+      .qwenTokenStatus()
+      .then(setQwenSaved)
+      .catch((reason) => setError(errorText(reason)))
   }, [])
 
   const openai = status?.providers.find((item) => item.id === 'openai')
@@ -210,6 +218,86 @@ function Settings({ onClose }: { onClose: () => void }) {
           Удалить
         </button>
       </div>
+      <h3 style={{ marginTop: 22 }}>Qwen</h3>
+      <p>
+        Аккаунт:{' '}
+        <strong>{qwen === 'checking' ? 'проверяю…' : qwen === 'in' ? 'вошёл' : qwen === 'out' ? 'не вошёл' : 'не проверен'}</strong>
+        {' · '}
+        token: <strong>{qwenSaved.token ? 'сохранён' : 'не задан'}</strong>
+        {' · '}
+        refresh: <strong>{qwenSaved.refreshToken ? 'сохранён' : 'не задан'}</strong>
+      </p>
+      <label className="field">
+        <span>Token</span>
+        <input type="password" value={qwenToken} placeholder="кука token" onChange={(event) => setQwenToken(event.target.value)} />
+      </label>
+      <label className="field">
+        <span>Refresh token</span>
+        <input
+          type="password"
+          value={qwenRefresh}
+          placeholder="кука refresh_token"
+          onChange={(event) => setQwenRefresh(event.target.value)}
+        />
+      </label>
+      <p className="meta">
+        В своём Chrome: F12 → Application → Cookies → https://chat.qwen.ai. Нужны две куки: token и refresh_token. Одного token мало: он быстро протухает, и сайт снова показывает вход. Сохранение записывает их в окно Qwen. Уже открытый вход при следующем запуске не затирается.
+      </p>
+      <div className="row">
+        <button
+          className="btn"
+          type="button"
+          onClick={() => {
+            setError(null)
+            void window.pipeline
+              .setQwenSession({ token: qwenToken, refreshToken: qwenRefresh })
+              .then((result) => {
+                setQwenToken('')
+                setQwenRefresh('')
+                setQwenSaved(result)
+              })
+              .catch((reason) => setError(errorText(reason)))
+          }}
+        >
+          Сохранить
+        </button>
+        <button
+          className="ghost"
+          type="button"
+          onClick={() => {
+            setError(null)
+            void window.pipeline
+              .clearQwenSession()
+              .then((result) => {
+                setQwenToken('')
+                setQwenRefresh('')
+                setQwenSaved(result)
+              })
+              .catch((reason) => setError(errorText(reason)))
+          }}
+        >
+          Удалить
+        </button>
+      </div>
+      <p className="meta">Проверка открывает обычное окно Chrome. Если Qwen показывает проверку, пройдите её в этом окне один раз. Если входа нет, войдите почтой Qwen: вход через Google в этом окне не проходит.</p>
+      <button
+        className="btn"
+        type="button"
+        disabled={qwen === 'checking'}
+        onClick={() => {
+          setQwen('checking')
+          setError(null)
+          void window.pipeline
+            .connectQwen()
+            .then((result) => setQwen(result.loggedIn ? 'in' : 'out'))
+            .catch((reason) => {
+              setQwen('out')
+              setError(errorText(reason))
+            })
+        }}
+      >
+        Проверить и войти
+      </button>
       <h3 style={{ marginTop: 22 }}>Глобальные переменные</h3>
       <p className="meta">Доступны в любом проекте как {'{{globals.имя}}'}.</p>
       <VariableEditor scope="global" />

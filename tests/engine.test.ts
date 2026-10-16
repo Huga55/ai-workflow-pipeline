@@ -3,7 +3,7 @@ import { describe, it } from 'node:test'
 import { runAiStep } from '@core/ai-step'
 import { WorkflowEngine } from '@core/engine'
 import { validateGraph } from '@core/graph'
-import { extractJson, validateJsonSchema } from '@core/json'
+import { extractJson, repairJson, validateJsonSchema } from '@core/json'
 import { MemoryStore } from '@core/memory-store'
 import { createRunners } from '@core/runners'
 import { createNeurophotoGraph } from '@core/template'
@@ -209,6 +209,147 @@ describe('json', () => {
     )
     expect(result.ok).toBe(true)
   })
+
+  it('escapes quotes inside strings and drops a trailing comma', () => {
+    const repaired = repairJson(
+      '{"what":"клише "строгой офисной дамы"","styling":"главным "украшением" кадра",}'
+    )
+    expect(repaired.ok).toBe(true)
+    if (repaired.ok) {
+      expect(repaired.value).toEqual({
+        what: 'клише "строгой офисной дамы"',
+        styling: 'главным "украшением" кадра'
+      })
+    }
+  })
+
+  it('keeps valid json and already escaped quotes', () => {
+    const repaired = repairJson('{"title":"say \\"hi\\""}')
+    expect(repaired.ok).toBe(true)
+    if (repaired.ok) expect(repaired.value).toEqual({ title: 'say "hi"' })
+  })
+
+  it('does not throw when the json cannot be repaired', () => {
+    const truncated = repairJson('{"a": "hi"')
+    expect(truncated.ok).toBe(false)
+    const commaInside = repairJson('{"a":"say "hi", pal"}')
+    expect(commaInside.ok).toBe(false)
+    const prose = repairJson('это не json')
+    expect(prose.ok).toBe(false)
+  })
+})
+
+describe('json repair on a step', () => {
+  it('saves the repaired answer and continues without another model call', async () => {
+    const store = new MemoryStore()
+    let calls = 0
+    const broken = '{"what":"клише "строгой офисной дамы"","styling":"главным "украшением" кадра"}'
+    const engine = new WorkflowEngine(
+      store,
+      createRunners({
+        generate: async () => {
+          calls += 1
+          return { raw: broken, providerResponse: null, model: 'test', provider: 'test' }
+        }
+      })
+    )
+    const steps = [
+      step({
+        id: 'parse',
+        key: 'parse',
+        type: 'ai',
+        order: 1,
+        config: {
+          provider: 'openai',
+          model: 'test',
+          messages: [{ id: 'm', role: 'user', content: 'дай json' }],
+          outputFormat: 'json'
+        }
+      }),
+      step({
+        id: 'use',
+        key: 'use',
+        type: 'transform',
+        order: 2,
+        dependsOn: ['parse'],
+        config: { mode: 'template', template: '{{steps.parse.output.what}}' }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('failed')
+    expect(calls).toBe(1)
+    expect(engine.repairStepJson({ runId: 'run', graph: graph(steps), inputs: {} }, 'parse', '')).toBe('paused')
+    expect(calls).toBe(1)
+    const fixed = store.executions.filter((item) => item.stepId === 'parse').sort((a, b) => b.attempt - a.attempt)[0]
+    expect(fixed.status).toBe('completed')
+    expect(fixed.meta.repairedJson).toBe(true)
+    expect(await run(engine, store, steps)).toBe('completed')
+    expect(calls).toBe(1)
+    const used = store.executions.find((item) => item.stepId === 'use' && item.status === 'completed')
+    const artifact = store.artifacts.find((item) => item.stepExecutionId === used?.id)
+    expect(artifact?.value).toBe('клише "строгой офисной дамы"')
+  })
+
+  it('keeps the failed step when the answer cannot be repaired', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(
+      store,
+      createRunners({
+        generate: async () => ({ raw: '{"a": "hi"', providerResponse: null, model: 'test', provider: 'test' })
+      })
+    )
+    const steps = [
+      step({
+        id: 'parse',
+        key: 'parse',
+        type: 'ai',
+        order: 1,
+        config: {
+          provider: 'openai',
+          model: 'test',
+          messages: [{ id: 'm', role: 'user', content: 'дай json' }],
+          outputFormat: 'json'
+        }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('failed')
+    const before = store.executions.length
+    assert.throws(() => engine.repairStepJson({ runId: 'run', graph: graph(steps), inputs: {} }, 'parse', ''), /Не удалось починить JSON/)
+    expect(store.executions.length).toBe(before)
+    expect(store.executions[0].status).toBe('failed')
+  })
+
+  it('does not accept repaired json that misses the schema', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(
+      store,
+      createRunners({
+        generate: async () => ({
+          raw: '{"title":"клише "строгой офисной дамы""}',
+          providerResponse: null,
+          model: 'test',
+          provider: 'test'
+        })
+      })
+    )
+    const steps = [
+      step({
+        id: 'parse',
+        key: 'parse',
+        type: 'ai',
+        order: 1,
+        config: {
+          provider: 'openai',
+          model: 'test',
+          messages: [{ id: 'm', role: 'user', content: 'дай json' }],
+          outputFormat: 'json',
+          jsonSchema: { type: 'object', required: ['count'], properties: { count: { type: 'number' } } }
+        }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('failed')
+    assert.throws(() => engine.repairStepJson({ runId: 'run', graph: graph(steps), inputs: {} }, 'parse', ''), /схема не сошлась/)
+    expect(store.executions.filter((item) => item.status === 'completed')).toHaveLength(0)
+  })
 })
 
 describe('engine', () => {
@@ -383,6 +524,160 @@ describe('engine', () => {
     expect(started).toBe(2)
     release()
     expect(await done).toBe('completed')
+  })
+
+  it('runs sequence branches one after another and stops when one fails', async () => {
+    const store = new MemoryStore()
+    let active = 0
+    let peak = 0
+    const order: string[] = []
+    const runners = createRunners()
+    runners.ai = async (context) => {
+      active += 1
+      peak = Math.max(peak, active)
+      const item = context.ctx.aliases.item as { title: string }
+      order.push(item.title)
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      active -= 1
+      if (item.title === 'B') return { status: 'failed', error: 'стоп', rawResponse: null }
+      return { status: 'completed', output: item.title, rawResponse: item.title }
+    }
+    const engine = new WorkflowEngine(store, runners)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }, { title: "B" }, { title: "C" }];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'item', launch: 'sequence' },
+        config: {}
+      }),
+      step({
+        id: 'use',
+        key: 'use',
+        type: 'ai',
+        order: 3,
+        dependsOn: ['items'],
+        config: { provider: 'openai', model: 'test', messages: [], outputFormat: 'text' }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('paused')
+    expect(peak).toBe(1)
+    expect(order).toEqual(['A', 'B'])
+    expect(store.branches.find((branch) => branch.label === 'C')?.status).toBe('pending')
+  })
+
+  it('continues the sequence queue after the failed branch is resumed', async () => {
+    const store = new MemoryStore()
+    const seen = new Map<string, number>()
+    const order: string[] = []
+    const runners = createRunners()
+    runners.ai = async (context) => {
+      const item = context.ctx.aliases.item as { title: string }
+      order.push(item.title)
+      const attempt = (seen.get(item.title) ?? 0) + 1
+      seen.set(item.title, attempt)
+      if (item.title === 'B' && attempt === 1) return { status: 'failed', error: 'стоп', rawResponse: null }
+      return { status: 'completed', output: item.title, rawResponse: item.title }
+    }
+    const engine = new WorkflowEngine(store, runners)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }, { title: "B" }, { title: "C" }];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'item', launch: 'sequence' },
+        config: {}
+      }),
+      step({
+        id: 'use',
+        key: 'use',
+        type: 'ai',
+        order: 3,
+        dependsOn: ['items'],
+        config: { provider: 'openai', model: 'test', messages: [], outputFormat: 'text' }
+      })
+    ]
+    const graphForRun = graph(steps)
+    expect(await run(engine, store, steps)).toBe('paused')
+    const failed = store.branches.find((branch) => branch.label === 'B')
+    expect(failed?.status).toBe('failed')
+    expect(
+      await engine.advance({
+        runId: 'run',
+        graph: graphForRun,
+        inputs: {},
+        focus: { stepId: 'use', branchId: failed?.id ?? '', mode: 'chain' }
+      })
+    ).toBe('completed')
+    expect(order).toEqual(['A', 'B', 'B', 'C'])
+    expect(store.branches.find((branch) => branch.label === 'C')?.status).toBe('completed')
+  })
+
+  it('does not start the next sequence branch when only this step is rerun', async () => {
+    const store = new MemoryStore()
+    const runners = createRunners()
+    runners.ai = async (context) => {
+      const item = context.ctx.aliases.item as { title: string }
+      if (item.title === 'B') return { status: 'failed', error: 'стоп', rawResponse: null }
+      return { status: 'completed', output: item.title, rawResponse: item.title }
+    }
+    const engine = new WorkflowEngine(store, runners)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }, { title: "B" }, { title: "C" }];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'item', launch: 'sequence' },
+        config: {}
+      }),
+      step({
+        id: 'use',
+        key: 'use',
+        type: 'ai',
+        order: 3,
+        dependsOn: ['items'],
+        config: { provider: 'openai', model: 'test', messages: [], outputFormat: 'text' }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('paused')
+    const failed = store.branches.find((branch) => branch.label === 'B')
+    runners.ai = async () => ({ status: 'completed', output: 'B', rawResponse: 'B' })
+    expect(
+      await engine.advance({
+        runId: 'run',
+        graph: graph(steps),
+        inputs: {},
+        focus: { stepId: 'use', branchId: failed?.id ?? '', mode: 'only' }
+      })
+    ).toBe('completed')
+    expect(store.branches.find((branch) => branch.label === 'C')?.status).toBe('pending')
   })
 
   it('runs steps listed after a fanout inside each branch', async () => {
@@ -984,6 +1279,42 @@ describe('engine', () => {
     expect(added.every((branch) => branch.status === 'pending')).toBe(true)
   })
 
+  it('does not copy a row when the parsed array matches an existing one', async () => {
+    const store = new MemoryStore()
+    const shots = [{ title: 'A' }, { title: 'B' }]
+    const steps = [
+      step({
+        id: 'parsed',
+        key: 'parsed',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return shots' }
+      }),
+      step({
+        id: 'draft',
+        key: 'draft',
+        type: 'transform',
+        order: 2,
+        dependsOn: ['parsed'],
+        iterate: { over: '{{steps.parsed.output}}', alias: 'item', launch: 'manual', appendOnRerun: true },
+        config: { mode: 'template', template: '{{item.title}}' }
+      })
+    ]
+    const runners = createRunners()
+    const base = runners.transform
+    runners.transform = async (context) => {
+      if (context.step.id === 'parsed') return { status: 'completed', output: shots, rawResponse: null }
+      return base(context)
+    }
+    const custom = new WorkflowEngine(store, runners)
+    expect(await run(custom, store, steps)).toBe('paused')
+    expect(await run(custom, store, steps, { focus: { stepId: 'parsed', branchId: '', mode: 'chain' }, appendBatch: true })).toBe('paused')
+    const created = store.branches.filter((branch) => branch.sourceStepId === 'draft')
+    expect(created).toHaveLength(2)
+    expect(created.map((branch) => branch.label).sort()).toEqual(['A', 'B'])
+    expect(created.every((branch) => branch.batch === 0)).toBe(true)
+  })
+
   it('runs request steps of a nested all-at-once fanout together', async () => {
     const store = new MemoryStore()
     let started = 0
@@ -1147,6 +1478,178 @@ describe('engine', () => {
     expect(values).toEqual(['A-S1', 'A-S2', 'A-S3', 'B-S1', 'B-S2', 'B-S3'])
   })
 
+  it('runs a side branch once on the concept, not once per nested shot', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }, { title: "B" }];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'concept', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'shot_list',
+        key: 'shot_list',
+        type: 'transform',
+        order: 3,
+        dependsOn: ['items'],
+        config: { mode: 'script', script: 'return ["S1", "S2"];' }
+      }),
+      step({
+        id: 'shots',
+        key: 'shots',
+        type: 'fanout',
+        order: 4,
+        dependsOn: ['shot_list'],
+        iterate: { over: '{{steps.shot_list.output}}', alias: 'shot', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'json',
+        key: 'json',
+        name: 'Формирование JSON по шоту',
+        type: 'transform',
+        order: 5,
+        dependsOn: ['shots'],
+        config: { mode: 'template', template: '{{concept.title}}-{{shot}}' }
+      }),
+      step({
+        id: 'extra',
+        key: 'extra',
+        name: 'Дополнительные шоты',
+        type: 'manual',
+        order: 9,
+        dependsOn: ['items'],
+        sideBranch: true,
+        config: { mode: 'text', prompt: 'Какие ещё кадры?', allowEmpty: true }
+      }),
+      step({
+        id: 'extra_ai',
+        key: 'extra_ai',
+        type: 'transform',
+        order: 10,
+        dependsOn: ['extra'],
+        config: { mode: 'template', template: 'later' }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('paused')
+    const concepts = store.branches.filter((branch) => branch.sourceStepId === 'items')
+    const shots = store.branches.filter((branch) => branch.sourceStepId === 'shots')
+    expect(concepts).toHaveLength(2)
+    expect(shots).toHaveLength(4)
+    const waiting = store.executions.filter((item) => item.stepId === 'extra' && item.status === 'waiting_for_user')
+    expect(waiting).toHaveLength(2)
+    expect(waiting.map((item) => item.branchId).sort()).toEqual(concepts.map((branch) => branch.id).sort())
+    expect(waiting.some((item) => shots.some((branch) => branch.id === item.branchId))).toBe(false)
+    const jsonDone = store.executions.filter((item) => item.stepId === 'json' && item.status === 'completed')
+    expect(jsonDone.length).toBe(shots.length)
+
+    const stray = { ...waiting[0], id: 'stray', branchId: shots[0].id, attempt: 1 }
+    store.insertExecution(stray)
+    expect(await run(engine, store, steps)).toBe('paused')
+    expect(store.executions.find((item) => item.id === 'stray')?.status).toBe('skipped')
+    const stillWaiting = store.executions.filter((item) => item.stepId === 'extra' && item.status === 'waiting_for_user')
+    expect(stillWaiting).toHaveLength(2)
+    expect(stillWaiting.every((item) => concepts.some((branch) => branch.id === item.branchId))).toBe(true)
+  })
+
+  it('continues a side branch on the concept when rerunning from a step there', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }, { title: "B" }];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'concept', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'shot_list',
+        key: 'shot_list',
+        type: 'transform',
+        order: 3,
+        dependsOn: ['items'],
+        config: { mode: 'script', script: 'return ["S1", "S2"];' }
+      }),
+      step({
+        id: 'shots',
+        key: 'shots',
+        type: 'fanout',
+        order: 4,
+        dependsOn: ['shot_list'],
+        iterate: { over: '{{steps.shot_list.output}}', alias: 'shot', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'json',
+        key: 'json',
+        type: 'transform',
+        order: 5,
+        dependsOn: ['shots'],
+        config: { mode: 'template', template: '{{concept.title}}-{{shot}}' }
+      }),
+      step({
+        id: 'extra',
+        key: 'extra',
+        name: 'Дополнительные шоты',
+        type: 'manual',
+        order: 9,
+        dependsOn: ['items'],
+        sideBranch: true,
+        config: { mode: 'text', prompt: 'Какие ещё кадры?', allowEmpty: true }
+      }),
+      step({
+        id: 'extra_ai',
+        key: 'extra_ai',
+        name: 'Формирование дополнительных шотов',
+        type: 'transform',
+        order: 10,
+        dependsOn: ['extra'],
+        config: { mode: 'template', template: 'later' }
+      })
+    ]
+    const options = { runId: 'run', graph: graph(steps), inputs: {} }
+    expect(await engine.advance(options)).toBe('paused')
+    const concept = store.branches.find((branch) => branch.sourceStepId === 'items' && branch.itemIndex === 0)
+    const shots = store.branches.filter((branch) => branch.sourceStepId === 'shots' && branch.parentBranchId === concept?.id)
+    expect(concept).toBeTruthy()
+    expect(shots).toHaveLength(2)
+    const asked = await engine.advance({
+      ...options,
+      focus: { stepId: 'extra', branchId: concept?.id ?? '', mode: 'chain' }
+    })
+    expect(asked).toBe('paused')
+    const waiting = store.executions.filter((item) => item.stepId === 'extra' && item.status === 'waiting_for_user' && item.branchId === concept?.id)
+    expect(waiting.length > 0).toBe(true)
+    expect(store.executions.some((item) => item.stepId === 'extra' && item.branchId === shots[0].id && item.status === 'waiting_for_user')).toBe(false)
+    const latest = waiting.sort((a, b) => b.attempt - a.attempt)[0]
+    expect(await engine.submitUserAction(options, latest.id, { type: 'text', text: 'крупный план' })).toBe('paused')
+    const followed = store.executions.filter((item) => item.stepId === 'extra_ai' && item.status === 'completed' && item.branchId === concept?.id)
+    expect(followed.length > 0).toBe(true)
+    expect(store.executions.some((item) => item.stepId === 'extra_ai' && shots.some((branch) => branch.id === item.branchId))).toBe(false)
+  })
+
   it('creates every nested branch when continuing one outer branch and when rerunning the chain', async () => {
     const store = new MemoryStore()
     const engine = new WorkflowEngine(store)
@@ -1222,7 +1725,264 @@ describe('engine', () => {
   })
 })
 
+describe('playwright chats', () => {
+  it('opens a chat for the run and sends only the new turn', async () => {
+    const store = new MemoryStore()
+    const opened: string[] = []
+    const sent: string[] = []
+    const runners = createRunners({
+      generate: async (request) => {
+        const text = request.messages
+          .flatMap((message) => message.content)
+          .filter((part) => part.type === 'text')
+          .map((part) => part.text)
+          .join('\n')
+        sent.push(`${request.runId}:${request.chat}:${text}`)
+        return { raw: 'ok', providerResponse: null, model: 'qwen', provider: 'qwen' }
+      }
+    })
+    const engine = new WorkflowEngine(store, runners)
+    const steps = [
+      step({
+        id: 'first',
+        key: 'first',
+        type: 'ai',
+        order: 1,
+        config: {
+          provider: 'qwen',
+          model: 'qwen',
+          chat: 'analyst',
+          messages: [{ id: 'm1', role: 'user', content: 'первый вопрос' }],
+          outputFormat: 'text'
+        }
+      }),
+      step({
+        id: 'second',
+        key: 'second',
+        type: 'ai',
+        order: 2,
+        dependsOn: ['first'],
+        config: {
+          provider: 'qwen',
+          model: 'qwen',
+          chat: 'analyst',
+          messages: [{ id: 'm2', role: 'user', content: 'второй вопрос' }],
+          outputFormat: 'text'
+        }
+      })
+    ]
+    const graph = {
+      runtime: 'playwright' as const,
+      inputs: [],
+      chats: [{ key: 'analyst', instruction: 'Ты аналитик упаковки.', scope: 'run' as const }],
+      steps
+    }
+    const advance = (runId: string) =>
+      engine.advance({
+        runId,
+        graph,
+        inputs: {},
+        openChats: async (request) => {
+          opened.push(`${request.runId}:${request.scope}:${request.branchId}`)
+        }
+      })
+    expect(await advance('run-a')).toBe('completed')
+    expect(await advance('run-b')).toBe('completed')
+    expect(opened).toEqual(['run-a:run:', 'run-b:run:'])
+    expect(sent).toEqual(['run-a:analyst:первый вопрос', 'run-a:analyst:второй вопрос', 'run-b:analyst:первый вопрос', 'run-b:analyst:второй вопрос'])
+    assert.equal(sent.join('\n').includes('Ты аналитик'), false)
+  })
+
+  it('opens a separate chat when a branch starts', async () => {
+    const store = new MemoryStore()
+    const opened: string[] = []
+    const runners = createRunners({
+      generate: async () => ({ raw: 'ok', providerResponse: null, model: 'qwen', provider: 'qwen' })
+    })
+    const engine = new WorkflowEngine(store, runners)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return ["A", "B"];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'item', launch: 'manual' },
+        config: {}
+      }),
+      step({
+        id: 'shot',
+        key: 'shot',
+        type: 'ai',
+        order: 3,
+        dependsOn: ['items'],
+        config: {
+          provider: 'qwen',
+          model: 'qwen',
+          chat: 'shots',
+          messages: [{ id: 'm', role: 'user', content: '{{item}}' }],
+          outputFormat: 'text'
+        }
+      })
+    ]
+    await engine.advance({
+      runId: 'run',
+      graph: {
+        runtime: 'playwright',
+        inputs: [],
+        chats: [{ key: 'shots', instruction: 'Кадры', scope: 'branch' }],
+        steps
+      },
+      inputs: {},
+      startManualBranches: true,
+      openChats: async (request) => {
+        opened.push(request.scope)
+      }
+    })
+    assert.deepEqual(opened, ['run', 'branch', 'branch'])
+  })
+
+  it('writes a run chat from inside a branch to the shared chat', async () => {
+    const store = new MemoryStore()
+    const sent: string[] = []
+    const runners = createRunners({
+      generate: async (request) => {
+        sent.push(`${request.chat}:${request.branchId ?? ''}`)
+        return { raw: 'ok', providerResponse: null, model: 'qwen', provider: 'qwen' }
+      }
+    })
+    const engine = new WorkflowEngine(store, runners)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return ["A", "B"];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'item', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'make',
+        key: 'make',
+        type: 'ai',
+        order: 3,
+        dependsOn: ['items'],
+        config: {
+          provider: 'qwen',
+          model: 'qwen',
+          chat: 'concept_maker',
+          messages: [{ id: 'm', role: 'user', content: '{{item}}' }],
+          outputFormat: 'text'
+        }
+      })
+    ]
+    expect(
+      await engine.advance({
+        runId: 'run',
+        graph: {
+          runtime: 'playwright',
+          inputs: [],
+          chats: [{ key: 'concept_maker', instruction: 'Концепт', scope: 'run' }],
+          steps
+        },
+        inputs: {},
+        openChats: async () => undefined
+      })
+    ).toBe('completed')
+    expect(sent).toEqual(['concept_maker:', 'concept_maker:'])
+  })
+})
+
 describe('ai step', () => {
+  it('sends playwright messages one after another and keeps the last reply', async () => {
+    let seen: string[] = []
+    const outcome = await runAiStep(
+      {
+        provider: 'qwen',
+        model: 'qwen',
+        chat: 'analyst',
+        outputFormat: 'json',
+        jsonSchema: { type: 'object', required: ['title'], properties: { title: { type: 'string' } } },
+        messages: [
+          { id: '1', role: 'user', content: 'Это оригинал, запомни.' },
+          { id: '2', role: 'user', content: 'Это реф. Напиши концепцию.' }
+        ]
+      },
+      { inputs: {}, steps: {}, aliases: {} },
+      async (request) => {
+        seen = request.messages.map((message) => message.content.map((part) => (part.type === 'text' ? part.text : '')).join(''))
+        return { raw: '{"title":"тихий свет"}', providerResponse: null, model: 'qwen', provider: 'qwen' }
+      },
+      undefined,
+      { runtime: 'playwright', runId: 'run', branchId: '' }
+    )
+    assert.equal(seen.length, 2)
+    assert.equal(seen[0], 'Это оригинал, запомни.')
+    assert.equal(seen[1]?.includes('Это реф. Напиши концепцию.'), true)
+    assert.equal(seen[1]?.includes('Return only valid JSON'), true)
+    assert.equal(seen[0]?.includes('Return only valid JSON'), false)
+    expect(outcome.status).toBe('completed')
+    expect(outcome.output).toEqual({ title: 'тихий свет' })
+  })
+
+  it('skips a whole message when a referenced value is missing', async () => {
+    let seen: string[] = []
+    const outcome = await runAiStep(
+      {
+        provider: 'qwen',
+        model: 'qwen',
+        chat: 'analyst',
+        outputFormat: 'text',
+        messages: [
+          { id: '1', role: 'user', content: 'Это оригинал.' },
+          { id: '2', role: 'user', content: 'Референс {{inputs.ref}}', when: { op: 'and', paths: ['inputs.ref', 'inputs.pose'] } },
+          { id: '3', role: 'user', content: 'Запасной {{inputs.alt}}', when: { op: 'or', paths: ['inputs.ref', 'inputs.alt'] } }
+        ]
+      },
+      { inputs: { alt: 'свет', pose: 'профиль' }, steps: {}, aliases: {} },
+      async (request) => {
+        seen = request.messages.map((message) => message.content.map((part) => (part.type === 'text' ? part.text : '')).join(''))
+        return { raw: 'ok', providerResponse: null, model: 'qwen', provider: 'qwen' }
+      },
+      undefined,
+      { runtime: 'playwright', runId: 'run', branchId: '' }
+    )
+    assert.deepEqual(seen, ['Это оригинал.', 'Запасной свет'])
+    expect(outcome.status).toBe('completed')
+    expect(outcome.output).toBe('ok')
+  })
+
+  it('fails when every message is skipped by its condition', async () => {
+    const outcome = await runAiStep(
+      {
+        provider: 'qwen',
+        model: 'qwen',
+        chat: 'analyst',
+        outputFormat: 'text',
+        messages: [{ id: '1', role: 'user', content: 'Референс {{inputs.ref}}', when: { op: 'and', paths: ['inputs.ref'] } }]
+      },
+      { inputs: {}, steps: {}, aliases: {} },
+      async () => ({ raw: 'ok', providerResponse: null, model: 'qwen', provider: 'qwen' })
+    )
+    expect(outcome.status).toBe('failed')
+    expect(outcome.error).toContain('пропущен')
+  })
+
   it('keeps the raw response when schema validation fails', async () => {
     const outcome = await runAiStep(
       {

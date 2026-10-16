@@ -5,9 +5,9 @@ import { createInput, createLinkedStep, createStep } from '@core/factories'
 import { effectiveStep, validateGraph } from '@core/graph'
 import { INPUT_TYPE_LABEL, STEP_TYPE_HINT, STEP_TYPE_LABEL, slugify, uniqueKey } from '@core/labels'
 import { latestVariableVersion, type VariablePools } from '@core/variables'
-import type { AIMessageDraft, InputDefinition, InputType, StepDefinition, StepType, WorkflowDetails, WorkflowGraph, WorkflowSnippet } from '@core/types'
+import type { AIMessageDraft, BranchLaunch, InputDefinition, InputType, MessageWhen, StepDefinition, StepType, WorkflowChat, WorkflowDetails, WorkflowGraph, WorkflowSnippet } from '@core/types'
 import { formatWorkflowJson, parseWorkflowJson, type WorkflowJsonDocument } from '@core/workflow-json'
-import { copyText, errorText, Hint, TemplateField, VariablePoolsContext } from '../ui'
+import { copyText, errorText, Hint, TemplateField, VariablePicker, VariablePoolsContext } from '../ui'
 
 const STEP_TYPES: StepType[] = ['ai', 'transform', 'parse', 'fanout', 'manual', 'merge', 'input']
 const INPUT_TYPES = Object.keys(INPUT_TYPE_LABEL) as InputType[]
@@ -317,6 +317,32 @@ export function WorkflowPage({
             Добавить фрагмент
           </button>
         )}
+        {graph.runtime === 'playwright' && (
+          <>
+            <p className="section-label">Чаты</p>
+            {(graph.chats ?? []).map((chat) => (
+              <button key={chat.key} className="step-tab" type="button" onClick={() => setSelectedId(`chat:${chat.key}`)}>
+                <span>{chat.key}</span>
+                <small>{chat.scope === 'branch' ? 'в каждой ветке' : 'на запуск'}</small>
+              </button>
+            ))}
+            {!structureLocked && (
+              <button
+                className="ghost"
+                type="button"
+                onClick={() => {
+                  const taken = new Set((graph.chats ?? []).map((item) => item.key))
+                  const key = uniqueKey('assistant', taken)
+                  const chats = [...(graph.chats ?? []), { key, instruction: '', scope: 'run' as const }]
+                  edit({ ...graph, chats })
+                  setSelectedId(`chat:${key}`)
+                }}
+              >
+                Добавить чат
+              </button>
+            )}
+          </>
+        )}
         <p className="section-label">Граф шагов</p>
         <div className="flow">
           {flow.orphans.map((side) => (
@@ -395,17 +421,46 @@ export function WorkflowPage({
           </div>
         </div>
         {view === 'builder' && (
+        <>
         <label className="field">
           <span>Описание</span>
           <input value={description} disabled={readOnly} onChange={(event) => { setDescription(event.target.value); setDirty(true) }} />
         </label>
+        <label className="field">
+          <span>Основа</span>
+          <select
+            value={graph.runtime ?? 'api'}
+            disabled={readOnly}
+            onChange={(event) => {
+              if (event.target.value === 'playwright') {
+                edit({ ...graph, runtime: 'playwright', chats: graph.chats ?? [] })
+                return
+              }
+              edit({
+                ...graph,
+                runtime: undefined,
+                chats: undefined,
+                steps: graph.steps.map(clearStepChat)
+              })
+            }}
+          >
+            <option value="api">API-запрос</option>
+            <option value="playwright">Playwright, чаты Qwen</option>
+          </select>
+          <p className="field-note">
+            {graph.runtime === 'playwright'
+              ? 'На запуске открываются чаты из преднастройки. Шаг дописывает в выбранный чат только новый текст. Новый запуск создаёт чаты заново.'
+              : 'Каждый AI-шаг сам отправляет весь свой контекст в API.'}
+          </p>
+        </label>
+        </>
         )}
         {readOnly && <div className="banner">Просмотр старой версии. Сохранение создаёт изменения только из последней версии.</div>}
         {error && <div className="error">{error}</div>}
         {view === 'json' ? (
           <div>
             <p className="field-note">
-              Объект с полями name, description, inputs и steps. Его можно целиком собрать в модели и вставить сюда. id лучше не писать: для новых шагов приложение создаст свои, а уже существующие оставит по ключу. dependsOn пишется ключом шага. Если текст изменился, сохранение проверяет синтаксис, форму шагов и граф.
+              Объект с полями name, description, inputs и steps. Для чатов Qwen в корне ещё runtime и chats. Его можно целиком собрать в модели и вставить сюда. id лучше не писать: для новых шагов приложение создаст свои, а уже существующие оставит по ключу. dependsOn пишется ключом шага. Если текст изменился, сохранение проверяет синтаксис, форму шагов и граф.
             </p>
             <div className="row" style={{ marginBottom: 8 }}>
               <button
@@ -448,6 +503,24 @@ export function WorkflowPage({
             }}
             onDelete={(key) => {
               edit({ ...graph, snippets: (graph.snippets ?? []).filter((item) => item.key !== key) })
+              setSelectedId(null)
+            }}
+          />
+        )}
+        {selectedId?.startsWith('chat:') && graph.runtime === 'playwright' && (
+          <ChatEditor
+            chat={(graph.chats ?? []).find((item) => item.key === selectedId.slice('chat:'.length)) ?? null}
+            readOnly={readOnly}
+            onChange={(chat, previousKey) => {
+              const chats = (graph.chats ?? []).map((item) => (item.key === previousKey ? chat : item))
+              const steps = graph.steps.map((step) =>
+                step.type === 'ai' && step.config.chat === previousKey ? { ...step, config: { ...step.config, chat: chat.key } } : step
+              )
+              edit({ ...graph, chats, steps })
+              setSelectedId(`chat:${chat.key}`)
+            }}
+            onDelete={(key) => {
+              edit({ ...graph, chats: (graph.chats ?? []).filter((item) => item.key !== key) })
               setSelectedId(null)
             }}
           />
@@ -608,6 +681,62 @@ function SideBranchBox({
           <FlowNodeButton step={step} graph={graph} selectedId={selectedId} onSelect={onSelect} />
         </div>
       ))}
+    </div>
+  )
+}
+
+function clearStepChat(step: StepDefinition): StepDefinition {
+  if (step.type !== 'ai' || !step.config.chat) return step
+  const { chat: _chat, ...config } = step.config
+  return { ...step, config }
+}
+
+function ChatEditor({
+  chat,
+  readOnly,
+  onChange,
+  onDelete
+}: {
+  chat: WorkflowChat | null
+  readOnly: boolean
+  onChange: (chat: WorkflowChat, previousKey: string) => void
+  onDelete: (key: string) => void
+}) {
+  if (!chat) return <p className="meta">Чат не найден</p>
+  return (
+    <div>
+      <h2>Чат</h2>
+      <label className="field">
+        <span>Ключ</span>
+        <input value={chat.key} disabled={readOnly} onChange={(event) => onChange({ ...chat, key: event.target.value }, chat.key)} />
+        <p className="field-note">Шаг выбирает этот чат по ключу.</p>
+      </label>
+      <label className="field">
+        <span>Где живёт</span>
+        <select
+          value={chat.scope}
+          disabled={readOnly}
+          onChange={(event) => onChange({ ...chat, scope: event.target.value as WorkflowChat['scope'] }, chat.key)}
+        >
+          <option value="run">Один на весь запуск</option>
+          <option value="branch">Свой в каждой ветке</option>
+        </select>
+      </label>
+      <label className="field">
+        <span>Инструкция</span>
+        <textarea
+          rows={10}
+          value={chat.instruction}
+          disabled={readOnly}
+          onChange={(event) => onChange({ ...chat, instruction: event.target.value }, chat.key)}
+        />
+        <p className="field-note">Уходит в новый чат один раз, в начале запуска или ветки. Можно вставить {`{{inputs...}}`} и фото.</p>
+      </label>
+      {!readOnly && (
+        <button className="danger" type="button" onClick={() => onDelete(chat.key)}>
+          Удалить чат
+        </button>
+      )}
     </div>
   )
 }
@@ -841,10 +970,11 @@ function StepEditor({
                 value={step.iterate.launch}
                 disabled={readOnly}
                 onChange={(event) =>
-                  onChange({ ...step, iterate: { ...step.iterate!, launch: event.target.value as 'all' | 'manual' } })
+                  onChange({ ...step, iterate: { ...step.iterate!, launch: event.target.value as BranchLaunch } })
                 }
               >
                 <option value="all">Все сразу</option>
+                <option value="sequence">Последовательно</option>
                 <option value="manual">Вручную, по одной</option>
               </select>
             </label>
@@ -889,7 +1019,7 @@ function StepEditor({
               />
               Каждый повтор — новый ряд
             </label>
-            <p className="field-note">Если включено, повторный запуск добавляет элементы новым рядом и не обновляет старые на месте.</p>
+            <p className="field-note">Другой массив добавляется новым рядом. Если разбор снова вернул те же элементы, ряд не копируется.</p>
           </>
         )}
       </fieldset>
@@ -921,12 +1051,39 @@ function StepConfig({
   onChange: (step: StepDefinition) => void
 }) {
   if (step.type === 'ai') {
+    const playwright = graph.runtime === 'playwright'
     return (
       <div>
+        {playwright && (
+          <label className="field">
+            <span>Чат</span>
+            <select
+              value={step.config.chat ?? ''}
+              disabled={readOnly}
+              onChange={(event) =>
+                onChange({
+                  ...step,
+                  config: { ...step.config, chat: event.target.value, provider: 'qwen', model: step.config.model || 'qwen' }
+                })
+              }
+            >
+              <option value="">Выберите чат</option>
+              {(graph.chats ?? []).map((chat) => (
+                <option key={chat.key} value={chat.key}>
+                  {chat.key}
+                </option>
+              ))}
+            </select>
+            <p className="field-note">Каждое сообщение с ролью user уходит отдельно, сверху вниз, и ждёт ответ. Результат шага — ответ на последнее отправленное. Инструкция чата уже отправлена. system и assistant в чат не пишутся.</p>
+          </label>
+        )}
+        {!playwright && (
         <label className="field">
           <span>Модель</span>
           <input value={step.config.model} disabled={readOnly} onChange={(event) => onChange({ ...step, config: { ...step.config, model: event.target.value } })} />
         </label>
+        )}
+        {!playwright && (
         <label className="field">
           <span>Temperature</span>
           <input
@@ -940,8 +1097,9 @@ function StepConfig({
                 config: { ...step.config, temperature: event.target.value === '' ? undefined : Number(event.target.value) }
               })
             }
-          />
+            />
         </label>
+        )}
         <label className="field">
           <span>Формат ответа</span>
           <select
@@ -963,6 +1121,23 @@ function StepConfig({
         <div className="messages">
           {step.config.messages.map((message) => (
             <div key={message.id} className="message">
+              <div className="row" style={{ justifyContent: 'space-between' }}>
+                <span className="meta">Сообщение</span>
+                {!readOnly && (
+                  <button
+                    className="ghost"
+                    type="button"
+                    onClick={() =>
+                      onChange({
+                        ...step,
+                        config: { ...step.config, messages: step.config.messages.filter((item) => item.id !== message.id) }
+                      })
+                    }
+                  >
+                    Удалить
+                  </button>
+                )}
+              </div>
               <label className="field">
                 <span>Роль</span>
                 <select
@@ -982,6 +1157,13 @@ function StepConfig({
                 step={step}
                 readOnly={readOnly}
                 onChange={(content) => updateMessage(step, message.id, { content }, onChange)}
+              />
+              <MessageWhenField
+                message={message}
+                graph={graph}
+                step={step}
+                readOnly={readOnly}
+                onChange={(when) => updateMessage(step, message.id, { when }, onChange)}
               />
             </div>
           ))}
@@ -1077,14 +1259,16 @@ function StepConfig({
               onChange({
                 ...step,
                 type: 'fanout',
-                iterate: { ...iterate, launch: event.target.value as 'all' | 'manual' },
+                iterate: { ...iterate, launch: event.target.value as BranchLaunch },
                 config: {}
               })
             }
           >
             <option value="all">Все сразу</option>
+            <option value="sequence">Последовательно</option>
             <option value="manual">Вручную, по одной</option>
           </select>
+          <p className="field-note">Последовательно ветки идут сами, одна за другой. Следующее сообщение в общий чат уходит после ответа на предыдущее.</p>
         </label>
         <label className="check">
           <input
@@ -1102,7 +1286,7 @@ function StepConfig({
           />
           Каждый повтор — новый ряд
         </label>
-        <p className="field-note">Если включено, повторный запуск добавляет элементы новым рядом и не обновляет старые на месте.</p>
+        <p className="field-note">Другой массив добавляется новым рядом. Если разбор снова вернул те же элементы, ряд не копируется.</p>
       </div>
     )
   }
@@ -1263,6 +1447,83 @@ function updateMessage(
       messages: step.config.messages.map((message) => (message.id === id ? { ...message, ...patch } : message))
     }
   })
+}
+
+function MessageWhenField({
+  message,
+  graph,
+  step,
+  readOnly,
+  onChange
+}: {
+  message: AIMessageDraft
+  graph: WorkflowGraph
+  step: StepDefinition
+  readOnly: boolean
+  onChange: (when: MessageWhen | undefined) => void
+}) {
+  const mode = message.when?.op ?? 'always'
+  const paths = message.when?.paths ?? []
+  function setPaths(op: 'and' | 'or', next: string[]) {
+    onChange({ op, paths: next })
+  }
+  return (
+    <div>
+      <label className="field">
+        <span>Отправлять сообщение</span>
+        <select
+          value={mode}
+          disabled={readOnly}
+          onChange={(event) => {
+            const value = event.target.value
+            if (value === 'always') onChange(undefined)
+            else setPaths(value as 'and' | 'or', paths.length ? paths : [''])
+          }}
+        >
+          <option value="always">всегда</option>
+          <option value="and">если все переменные есть</option>
+          <option value="or">если хотя бы одна переменная есть</option>
+        </select>
+      </label>
+      {message.when && (
+        <>
+          <p className="field-note">Пустая переменная пропускает всё сообщение, а не кусок текста. Несколько путей складываются через «все» или «хотя бы одна».</p>
+          {paths.map((path, index) => (
+            <label className="field" key={`${message.id}-${index}`}>
+              <span>Переменная {index + 1}</span>
+              <input
+                value={path}
+                disabled={readOnly}
+                placeholder="inputs.ref"
+                onChange={(event) => setPaths(message.when!.op, paths.map((item, itemIndex) => (itemIndex === index ? event.target.value.trim() : item)))}
+              />
+            </label>
+          ))}
+          {!readOnly && (
+            <div className="row">
+              <VariablePicker
+                graph={graph}
+                step={step}
+                onPick={(path) => {
+                  const empty = paths.findIndex((item) => !item.trim())
+                  if (empty >= 0) setPaths(message.when!.op, paths.map((item, itemIndex) => (itemIndex === empty ? path : item)))
+                  else setPaths(message.when!.op, [...paths, path])
+                }}
+              />
+              <button className="ghost" type="button" onClick={() => setPaths(message.when!.op, [...paths, ''])}>
+                Добавить переменную
+              </button>
+              {paths.length > 1 && (
+                <button className="ghost" type="button" onClick={() => setPaths(message.when!.op, paths.slice(0, -1))}>
+                  Убрать последнюю
+                </button>
+              )}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
 }
 
 function SchemaField({ value, readOnly, onChange }: { value: unknown; readOnly: boolean; onChange: (value: unknown) => void }) {
