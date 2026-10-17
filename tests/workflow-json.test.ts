@@ -16,6 +16,8 @@ describe('workflow json', () => {
     const text = formatWorkflowJson({ name: 'Full Product Shoot', description: 'Съёмка', graph })
     assert.match(text, /\n  "name": "Full Product Shoot"/)
     assert.match(text, /\n  "inputs": \[/)
+    assert.match(text, /"dependsOn": \[\s*"concept_generator"/)
+    assert.doesNotMatch(text, /"dependsOn": \[[^\]]*"33333333-3333-4333-8333-333333333333"/)
     const parsed = parseWorkflowJson(text)
     assert.equal(parsed.ok, true)
     if (!parsed.ok) return

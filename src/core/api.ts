@@ -11,6 +11,13 @@ import type {
   WorkflowGraph
 } from '@core/types'
 
+export type MediaBlob = {
+  name: string
+  mime: string
+  bytes: Uint8Array
+  kind: 'image' | 'file'
+}
+
 export type PipelineApi = {
   listProjects: () => Promise<Project[]>
   createProject: (input: { name: string; description?: string }) => Promise<Project>
@@ -57,6 +64,7 @@ export type PipelineApi = {
   ) => Promise<RunDetails>
   skipStep: (runId: string, stepId: string, branchId: string) => Promise<RunDetails>
   repairStepJson: (runId: string, stepId: string, branchId: string) => Promise<RunDetails>
+  acceptManualAnswer: (runId: string, stepId: string, branchId: string, text: string, continueAfter?: boolean) => Promise<RunDetails>
   listVariables: (scope: 'global' | 'project', projectId?: string) => Promise<NamedVariable[]>
   saveVariable: (input: {
     scope: 'global' | 'project'
@@ -73,7 +81,9 @@ export type PipelineApi = {
   deleteVariable: (id: string) => Promise<void>
   submitUserAction: (runId: string, executionId: string, payload: UserActionPayload) => Promise<RunDetails>
   cancelRun: (runId: string) => Promise<RunDetails>
-  pickFiles: (kind: 'image' | 'file', multiple: boolean) => Promise<StoredFile[]>
+  pickFiles: (kind: 'image' | 'file' | 'auto', multiple: boolean) => Promise<StoredFile[]>
+  storeMedia: (items: MediaBlob[]) => Promise<StoredFile[]>
+  pasteMedia: (accept: 'image' | 'file' | 'any') => Promise<StoredFile[]>
   getProviderStatus: () => Promise<ProviderStatus>
   setProviderKey: (providerId: string, apiKey: string) => Promise<ProviderStatus>
   clearProviderKey: (providerId: string) => Promise<ProviderStatus>

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, net, protocol } from 'electron'
+import { app, BrowserWindow, Menu, net, protocol, session } from 'electron'
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -85,6 +85,10 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  session.defaultSession.setPermissionCheckHandler((_contents, permission) => permission === 'clipboard-read' || permission === 'clipboard-sanitized-write')
+  session.defaultSession.setPermissionRequestHandler((_contents, permission, callback) => {
+    callback(permission === 'clipboard-read' || permission === 'clipboard-sanitized-write')
+  })
   const userData = app.getPath('userData')
   const mediaDir = path.join(userData, 'media')
   mkdirSync(mediaDir, { recursive: true })

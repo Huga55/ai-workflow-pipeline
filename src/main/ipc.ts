@@ -1,4 +1,7 @@
-import { app, BrowserWindow, dialog, ipcMain } from 'electron'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
+import { app, BrowserWindow, clipboard, dialog, ipcMain } from 'electron'
+import { pathsFromUriList } from '@core/clipboard-files'
 import type { UserActionPayload, WorkflowGraph } from '@core/types'
 import type { AppService } from './service'
 
@@ -64,6 +67,11 @@ export function registerIpc(service: AppService, getWindow: () => BrowserWindow 
   ipcMain.handle('repairStepJson', (_event, runId: string, stepId: string, branchId: string) =>
     service.repairStepJson(runId, stepId, branchId)
   )
+  ipcMain.handle(
+    'acceptManualAnswer',
+    (_event, runId: string, stepId: string, branchId: string, text: string, continueAfter?: boolean) =>
+      service.acceptManualAnswer(runId, stepId, branchId, text, continueAfter)
+  )
   ipcMain.handle('listVariables', (_event, scope: 'global' | 'project', projectId?: string) => service.listVariables(scope, projectId))
   ipcMain.handle(
     'saveVariable',
@@ -91,7 +99,7 @@ export function registerIpc(service: AppService, getWindow: () => BrowserWindow 
   ipcMain.handle('qwenTokenStatus', () => service.qwenTokenStatus())
   ipcMain.handle('setQwenSession', (_event, input: { token?: string; refreshToken?: string }) => service.setQwenSession(input))
   ipcMain.handle('clearQwenSession', () => service.clearQwenSession())
-  ipcMain.handle('pickFiles', async (_event, kind: 'image' | 'file', multiple: boolean) => {
+  ipcMain.handle('pickFiles', async (_event, kind: 'image' | 'file' | 'auto', multiple: boolean) => {
     const win = getWindow()
     const options = {
       properties: multiple ? ['openFile' as const, 'multiSelections' as const] : ['openFile' as const],
@@ -101,6 +109,10 @@ export function registerIpc(service: AppService, getWindow: () => BrowserWindow 
     if (result.canceled) return []
     return service.storePickedFiles(result.filePaths, kind)
   })
+  ipcMain.handle('storeMedia', (_event, items: { name: string; mime: string; bytes: Uint8Array; kind: 'image' | 'file' }[]) =>
+    service.storeMedia(items)
+  )
+  ipcMain.handle('pasteMedia', (_event, accept: 'image' | 'file' | 'any') => pasteClipboardMedia(service, accept))
   ipcMain.handle('quitApp', () => {
     app.quit()
   })
@@ -131,6 +143,106 @@ function exportDialogOptions() {
     defaultPath: `pipeline-${day}.pipeline`,
     filters: [{ name: 'Файл Pipeline', extensions: ['pipeline'] }]
   }
+}
+
+const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif'])
+
+async function pasteClipboardMedia(service: AppService, accept: 'image' | 'file' | 'any') {
+  const items = await clipboard.read()
+  const paths: string[] = []
+  const images: { mime: string; bytes: Uint8Array }[] = []
+  for (const item of items) {
+    for (const type of item.types) {
+      const payload = await clipboardPayload(item, type)
+      if (!payload) continue
+      if (isFileListType(type)) {
+        paths.push(...droppedPaths(Buffer.from(payload.bytes), type.toLowerCase().includes('filenamew') ? 0 : -1, type.toLowerCase().includes('filenamew')))
+        continue
+      }
+      if (type === 'text/uri-list' || type === 'public.file-url') {
+        paths.push(...pathsFromUriList(payload.text).filter((filePath) => existsSync(filePath)))
+        continue
+      }
+      if (!looksLikeImage(type, payload.bytes)) continue
+      const mime = imageMime(type, payload.bytes)
+      images.push({ mime, bytes: payload.bytes })
+    }
+  }
+  const found = [...new Set(paths)]
+  const picked = found.filter((filePath) => accept !== 'image' || IMAGE_EXT.has(path.extname(filePath).toLowerCase()))
+  if (picked.length) return service.storePickedFiles(picked, accept === 'any' ? 'auto' : accept)
+  const image = images.find((item) => item.mime === 'image/png') ?? images[0]
+  if (!image) return []
+  const ext = image.mime === 'image/jpeg' ? 'jpg' : image.mime === 'image/webp' ? 'webp' : image.mime === 'image/gif' ? 'gif' : 'png'
+  return service.storeMedia([
+    {
+      name: `clipboard.${ext}`,
+      mime: image.mime,
+      bytes: image.bytes,
+      kind: accept === 'file' ? 'file' : 'image'
+    }
+  ])
+}
+
+async function clipboardPayload(item: Electron.ClipboardItem, type: string): Promise<{ bytes: Uint8Array; text: string } | null> {
+  try {
+    const payload = await item.getType(type)
+    if (typeof payload === 'string') return { bytes: new TextEncoder().encode(payload), text: payload }
+    if (!payload || typeof payload !== 'object' || !('arrayBuffer' in payload) || typeof payload.arrayBuffer !== 'function') return null
+    const bytes = new Uint8Array(await payload.arrayBuffer())
+    const text = 'text' in payload && typeof payload.text === 'function' ? await payload.text() : new TextDecoder().decode(bytes)
+    return { bytes, text }
+  } catch {
+    return null
+  }
+}
+
+function isFileListType(type: string): boolean {
+  const lower = type.toLowerCase()
+  return lower.includes('cf_hdrop') || lower.includes('filenamew')
+}
+
+function looksLikeImage(type: string, bytes: Uint8Array): boolean {
+  const lower = type.toLowerCase()
+  if (lower.startsWith('image/')) return true
+  if (!/png|jpe?g|gif|webp|bmp/.test(lower)) return false
+  return isPng(bytes) || isJpeg(bytes) || isGif(bytes)
+}
+
+function imageMime(type: string, bytes: Uint8Array): string {
+  if (type.toLowerCase().startsWith('image/')) return type === 'image/jpg' ? 'image/jpeg' : type
+  if (isJpeg(bytes)) return 'image/jpeg'
+  if (isGif(bytes)) return 'image/gif'
+  return 'image/png'
+}
+
+function isPng(bytes: Uint8Array): boolean {
+  return bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47
+}
+
+function isJpeg(bytes: Uint8Array): boolean {
+  return bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8
+}
+
+function isGif(bytes: Uint8Array): boolean {
+  return bytes.length > 4 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46
+}
+
+function droppedPaths(buffer: Buffer, offset = -1, wide = false): string[] {
+  if (!buffer.length) return []
+  let start = offset
+  let isWide = wide
+  if (start < 0) {
+    if (buffer.length < 20) return []
+    start = buffer.readUInt32LE(0)
+    isWide = buffer.readUInt32LE(16) !== 0
+  }
+  if (start < 0 || start >= buffer.length) return []
+  const text = buffer.slice(start).toString(isWide ? 'utf16le' : 'utf8')
+  return text
+    .split('\u0000')
+    .map((item) => item.trim())
+    .filter((item) => item && existsSync(item))
 }
 
 function importDialogOptions() {

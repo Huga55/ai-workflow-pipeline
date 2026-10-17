@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync } from 'node:fs'
 import { chromium, type BrowserContext, type Locator, type Page } from 'playwright-core'
+import { stitchChunks, stripCodeGutter } from '@core/json'
 import type { ContentPart } from '@core/types'
 
 const CHAT_URL = 'https://chat.qwen.ai/'
@@ -514,7 +515,7 @@ async function waitForAnswer(page: Page, before: number, seen: ChatMark, signal?
       }
       const quietMs = phase === 'ready' ? QUIET_READY_MS : QUIET_UNMARKED_MS
       if (text === stable) {
-        if (Date.now() - stableSince > quietMs) return text
+        if (Date.now() - stableSince > quietMs) return preferFullCode(page, text)
       } else {
         stable = text
         stableSince = Date.now()
@@ -699,4 +700,111 @@ async function lastAnswer(page: Page): Promise<string> {
     const source = markdown instanceof HTMLElement ? markdown : last
     return source.innerText.trim()
   })
+}
+
+async function preferFullCode(page: Page, fallback: string): Promise<string> {
+  const copied = await copiedCode(page).catch(() => null)
+  if (copied && preferAnswer(copied, fallback) === copied) return copied
+  const scrolled = await readFullCode(page).catch(() => null)
+  return preferAnswer(scrolled, fallback)
+}
+
+function preferAnswer(candidate: string | null, fallback: string): string {
+  if (!candidate) return fallback
+  const clean = stripCodeGutter(candidate)
+  if (clean.startsWith('{') || clean.startsWith('[')) return clean
+  if (numberedViewport(fallback) && clean.length > 40) return clean
+  if (clean.length > fallback.length) return clean
+  return fallback
+}
+
+function numberedViewport(text: string): boolean {
+  const lines = text.split('\n').map((line) => line.trim()).filter(Boolean)
+  let numbers = 0
+  for (const line of lines) {
+    if (/^(json|javascript|js|ts|txt|text)$/i.test(line)) continue
+    if (!/^\d+$/.test(line)) break
+    numbers += 1
+  }
+  return numbers >= 5
+}
+
+async function copiedCode(page: Page): Promise<string | null> {
+  const scope = page.locator('.response-message-content').last().locator('.qwen-markdown')
+  const button = scope
+    .locator('[class*="copy" i], button[aria-label*="copy" i], button[aria-label*="копир" i], button[aria-label*="复制" i]')
+    .last()
+  if (!(await button.count())) return null
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: 'https://chat.qwen.ai' }).catch(() => undefined)
+  await button.click({ timeout: 2000 })
+  const text = await page.evaluate(() => navigator.clipboard.readText()).catch(() => '')
+  return text.trim() || null
+}
+
+async function readFullCode(page: Page): Promise<string | null> {
+  const chunks = await page.evaluate(async () => {
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, 40))
+    const messages = [...document.querySelectorAll('.response-message-content')].filter(
+      (node) => node instanceof HTMLElement && node.innerText.trim()
+    )
+    const last = messages.at(-1)
+    if (!(last instanceof HTMLElement)) return []
+    const markdown = last.querySelector('.qwen-markdown')
+    const scope = markdown instanceof HTMLElement ? markdown : last
+    const looksJson = (text: string) => /"\w+"\s*:/.test(text)
+    const codeColumn = (host: HTMLElement): string => {
+      let best = ''
+      for (const node of [host, ...host.querySelectorAll('*')]) {
+        if (!(node instanceof HTMLElement)) continue
+        const text = node.innerText.trim()
+        if (!looksJson(text)) continue
+        const lines = text.split('\n').map((line) => line.trim()).filter(Boolean)
+        const numeric = lines.filter((line) => /^\d+$/.test(line)).length
+        if (lines.length && numeric >= lines.length * 0.4) continue
+        if (text.length > best.length) best = text
+      }
+      return best
+    }
+    let host: HTMLElement | null = null
+    let viewport = Infinity
+    let fallback: HTMLElement | null = null
+    let fallbackLength = 0
+    for (const node of [scope, ...scope.querySelectorAll('*')]) {
+      if (!(node instanceof HTMLElement)) continue
+      const text = node.innerText
+      if (!looksJson(text)) continue
+      if (text.length > fallbackLength) {
+        fallback = node
+        fallbackLength = text.length
+      }
+      const scrollable = node.scrollHeight > node.clientHeight + 24 && node.clientHeight > 40
+      if (scrollable && node.clientHeight < viewport) {
+        host = node
+        viewport = node.clientHeight
+      }
+    }
+    host = host ?? fallback
+    if (!host) return []
+    const chunks: string[] = []
+    const push = () => {
+      const piece = codeColumn(host)
+      if (piece) chunks.push(piece)
+    }
+    if (host.scrollHeight <= host.clientHeight + 24) {
+      push()
+      return chunks
+    }
+    host.scrollTop = 0
+    await sleep(30)
+    for (let step = 0; step < 80; step += 1) {
+      push()
+      if (host.scrollTop + host.clientHeight >= host.scrollHeight - 2) break
+      host.scrollTop += Math.max(24, host.clientHeight - 16)
+      await sleep(30)
+    }
+    push()
+    return chunks
+  })
+  if (!chunks.length) return null
+  return stitchChunks(chunks).trim()
 }

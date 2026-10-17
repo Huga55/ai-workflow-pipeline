@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { isStoredFile, toMediaUrl } from '@core/media'
+import { isStoredFile, isTextWithFiles, storedFiles, toMediaUrl } from '@core/media'
 import { pretty } from '@core/labels'
 import { variableCatalog, type VariablePools } from '@core/variables'
 import type { StepDefinition, WorkflowGraph } from '@core/types'
@@ -31,16 +31,41 @@ export async function copyText(value: string): Promise<void> {
 }
 
 export function JsonView({ value }: { value: unknown }) {
+  if (isTextWithFiles(value)) {
+    return (
+      <div>
+        {value.text && <pre className="json">{value.text}</pre>}
+        <div className="row">
+          {value.files.map((file) =>
+            file.kind === 'image' ? (
+              <img key={file.path} className="preview" src={toMediaUrl(file.path)} alt={file.name} />
+            ) : (
+              <span key={file.path} className="meta">
+                {file.name}
+              </span>
+            )
+          )}
+        </div>
+      </div>
+    )
+  }
   if (isStoredFile(value, 'image')) {
     const image = value as { path: string; name: string }
     return <img className="preview" src={toMediaUrl(image.path)} alt={image.name} />
   }
-  if (Array.isArray(value) && value.every((item) => isStoredFile(item, 'image'))) {
+  const files = storedFiles(value)
+  if (Array.isArray(value) && files.length === value.length && files.length > 0) {
     return (
       <div className="row">
-        {value.map((item) => (
-          <img key={(item as { path: string }).path} className="preview" src={toMediaUrl((item as { path: string }).path)} alt="" />
-        ))}
+        {files.map((file) =>
+          file.kind === 'image' ? (
+            <img key={file.path} className="preview" src={toMediaUrl(file.path)} alt={file.name} />
+          ) : (
+            <span key={file.path} className="meta">
+              {file.name}
+            </span>
+          )
+        )}
       </div>
     )
   }
@@ -60,12 +85,19 @@ export function clipboardPlainText(data: DataTransfer | null): string | null {
   return doc.body.innerText.replaceAll('\u00a0', ' ')
 }
 
+export function clipboardHasFiles(data: DataTransfer | null): boolean {
+  if (!data) return false
+  if (data.files.length > 0) return true
+  return [...data.items].some((item) => item.kind === 'file')
+}
+
 export function installPlainPaste(): () => void {
   const onPaste = (event: ClipboardEvent) => {
     const el = event.target
     if (!(el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement)) return
     if (el.disabled || el.readOnly) return
     if (el instanceof HTMLInputElement && !['text', 'search', 'url', '', 'password'].includes(el.type)) return
+    if (clipboardHasFiles(event.clipboardData)) return
     const text = clipboardPlainText(event.clipboardData)
     if (!text) return
     event.preventDefault()

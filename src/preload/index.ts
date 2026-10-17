@@ -30,6 +30,8 @@ const api: PipelineApi = {
   runStep: (runId, stepId, branchId, mode, options) => ipcRenderer.invoke('runStep', runId, stepId, branchId, mode, options),
   skipStep: (runId, stepId, branchId) => ipcRenderer.invoke('skipStep', runId, stepId, branchId),
   repairStepJson: (runId, stepId, branchId) => ipcRenderer.invoke('repairStepJson', runId, stepId, branchId),
+  acceptManualAnswer: (runId, stepId, branchId, text, continueAfter) =>
+    ipcRenderer.invoke('acceptManualAnswer', runId, stepId, branchId, text, continueAfter),
   listVariables: (scope, projectId) => ipcRenderer.invoke('listVariables', scope, projectId),
   saveVariable: (input) => ipcRenderer.invoke('saveVariable', input),
   updateVariable: (input) => ipcRenderer.invoke('updateVariable', input),
@@ -40,6 +42,8 @@ const api: PipelineApi = {
   submitUserAction: (runId, executionId, payload: UserActionPayload) => ipcRenderer.invoke('submitUserAction', runId, executionId, payload),
   cancelRun: (runId) => ipcRenderer.invoke('cancelRun', runId),
   pickFiles: (kind, multiple) => ipcRenderer.invoke('pickFiles', kind, multiple),
+  storeMedia: (items) => ipcRenderer.invoke('storeMedia', items),
+  pasteMedia: (accept) => ipcRenderer.invoke('pasteMedia', accept),
   getProviderStatus: () => ipcRenderer.invoke('getProviderStatus'),
   setProviderKey: (providerId, apiKey) => ipcRenderer.invoke('setProviderKey', providerId, apiKey),
   clearProviderKey: (providerId) => ipcRenderer.invoke('clearProviderKey', providerId),

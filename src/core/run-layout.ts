@@ -123,7 +123,7 @@ function layoutChain(
       pieces.push(fanoutPiece(details, source, step, parentBranchId, nodes, edges, plans, skipRoots))
       continue
     }
-    const execution = latestExecution(details.executions, step.id, parentBranchId)
+    const execution = stepExecution(details, step.id, parentBranchId)
     const item = Boolean(parentBranch && step.id === entryStepId)
     const title = item && parentBranch ? `${parentBranch.itemIndex + 1}. ${parentBranch.label}` : step.name
     const meta = item ? 'элемент' : STEP_TYPE_LABEL[step.type]
@@ -330,6 +330,39 @@ function splitStatus(details: RunDetails, stepId: string, parentBranchId: string
 
 function latestExecution(executions: StepExecution[], stepId: string, branchId: string): StepExecution | undefined {
   return executions.filter((item) => item.stepId === stepId && item.branchId === branchId).sort((a, b) => b.attempt - a.attempt)[0]
+}
+
+export function stepExecution(details: RunDetails, stepId: string, branchId: string): StepExecution | undefined {
+  const own = latestExecution(details.executions, stepId, branchId)
+  if (own) return own
+  const children = descendantBranchIds(details.branches, branchId)
+  const ownedBy = new Map<string, boolean>()
+  const misplaced = details.executions.filter((item) => {
+    if (item.stepId !== stepId || !children.has(item.branchId) || item.meta.fanoutError) return false
+    const sourceId = details.branches.find((branch) => branch.id === item.branchId)?.sourceStepId
+    if (!sourceId) return false
+    let owned = ownedBy.get(sourceId)
+    if (owned === undefined) {
+      owned = fanoutInnerSteps(sourceId, details.graph.steps).some((inner) => inner.id === stepId)
+      ownedBy.set(sourceId, owned)
+    }
+    return !owned
+  })
+  return misplaced.sort((a, b) => Date.parse(b.startedAt ?? '') - Date.parse(a.startedAt ?? ''))[0]
+}
+
+function descendantBranchIds(branches: RunDetails['branches'], rootId: string): Set<string> {
+  const out = new Set<string>()
+  const stack = branches.filter((branch) => branch.parentBranchId === rootId).map((branch) => branch.id)
+  while (stack.length) {
+    const id = stack.pop()
+    if (!id || out.has(id)) continue
+    out.add(id)
+    for (const branch of branches) {
+      if (branch.parentBranchId === id) stack.push(branch.id)
+    }
+  }
+  return out
 }
 
 function wrapLines(text: string, maxWidth: number, charWidth: number): string[] {

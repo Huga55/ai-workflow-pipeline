@@ -1119,23 +1119,36 @@ function StepConfig({
           />
         )}
         <div className="messages">
-          {step.config.messages.map((message) => (
+          {step.config.messages.map((message, index) => (
             <div key={message.id} className="message">
               <div className="row" style={{ justifyContent: 'space-between' }}>
-                <span className="meta">Сообщение</span>
+                <span className="meta">Сообщение {index + 1}</span>
                 {!readOnly && (
-                  <button
-                    className="ghost"
-                    type="button"
-                    onClick={() =>
-                      onChange({
-                        ...step,
-                        config: { ...step.config, messages: step.config.messages.filter((item) => item.id !== message.id) }
-                      })
-                    }
-                  >
-                    Удалить
-                  </button>
+                  <div className="row">
+                    <button className="ghost" type="button" disabled={index === 0} onClick={() => moveMessage(step, index, -1, onChange)}>
+                      Выше
+                    </button>
+                    <button
+                      className="ghost"
+                      type="button"
+                      disabled={index === step.config.messages.length - 1}
+                      onClick={() => moveMessage(step, index, 1, onChange)}
+                    >
+                      Ниже
+                    </button>
+                    <button
+                      className="ghost"
+                      type="button"
+                      onClick={() =>
+                        onChange({
+                          ...step,
+                          config: { ...step.config, messages: step.config.messages.filter((item) => item.id !== message.id) }
+                        })
+                      }
+                    >
+                      Удалить
+                    </button>
+                  </div>
                 )}
               </div>
               <label className="field">
@@ -1432,6 +1445,20 @@ function StepConfig({
     )
   }
   return null
+}
+
+function moveMessage(
+  step: Extract<StepDefinition, { type: 'ai' }>,
+  index: number,
+  direction: -1 | 1,
+  onChange: (step: StepDefinition) => void
+) {
+  const next = index + direction
+  const messages = [...step.config.messages]
+  if (next < 0 || next >= messages.length) return
+  const [item] = messages.splice(index, 1)
+  messages.splice(next, 0, item)
+  onChange({ ...step, config: { ...step.config, messages } })
 }
 
 function updateMessage(

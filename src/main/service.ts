@@ -17,6 +17,8 @@ import { createProvider, PROVIDERS } from './providers'
 import { QwenBrowser } from './qwen-browser'
 import { SecretStore } from './secrets'
 
+const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif'])
+
 const MIME: Record<string, string> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -490,6 +492,13 @@ export class AppService {
     )
   }
 
+  async acceptManualAnswer(runId: string, stepId: string, branchId: string, text: string, continueAfter = false): Promise<RunDetails> {
+    this.guardRunnable(runId)
+    return this.withLock(runId, (signal) =>
+      this.engine.acceptManualAnswer(this.baseOptions(runId, signal), stepId, branchId, text, continueAfter)
+    )
+  }
+
   async submitUserAction(runId: string, executionId: string, payload: UserActionPayload): Promise<RunDetails> {
     const details = this.guardRunnable(runId)
     const execution = details.executions.find((item) => item.id === executionId)
@@ -519,18 +528,35 @@ export class AppService {
     return this.getRun(runId)
   }
 
-  storePickedFiles(filePaths: string[], kind: 'image' | 'file'): StoredFile[] {
+  storePickedFiles(filePaths: string[], kind: 'image' | 'file' | 'auto'): StoredFile[] {
     mkdirSync(this.mediaDir, { recursive: true })
     return filePaths.map((filePath) => {
       const ext = path.extname(filePath).toLowerCase()
       const name = path.basename(filePath)
+      const storedKind = kind === 'auto' ? (IMAGE_EXT.has(ext) ? 'image' : 'file') : kind
       const stored = path.join(this.mediaDir, `${createId()}${ext}`)
       copyFileSync(filePath, stored)
       return {
-        kind,
+        kind: storedKind,
         path: stored,
-        mime: MIME[ext] || (kind === 'image' ? 'image/png' : 'application/octet-stream'),
+        mime: MIME[ext] || (storedKind === 'image' ? 'image/png' : 'application/octet-stream'),
         name
+      }
+    })
+  }
+
+  storeMedia(items: { name: string; mime: string; bytes: Uint8Array; kind: 'image' | 'file' }[]): StoredFile[] {
+    mkdirSync(this.mediaDir, { recursive: true })
+    return items.map((item) => {
+      const safeName = path.basename(item.name || '') || (item.kind === 'image' ? 'clipboard.png' : 'clipboard.bin')
+      const ext = extensionFor(safeName, item.mime)
+      const stored = path.join(this.mediaDir, `${createId()}${ext}`)
+      writeFileSync(stored, Buffer.from(item.bytes))
+      return {
+        kind: item.kind,
+        path: stored,
+        mime: item.mime || MIME[ext] || (item.kind === 'image' ? 'image/png' : 'application/octet-stream'),
+        name: safeName
       }
     })
   }

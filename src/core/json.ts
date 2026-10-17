@@ -6,6 +6,11 @@ export function extractJson(text: string): unknown {
   const trimmed = text.trim()
   const direct = tryParse(trimmed)
   if (direct.ok) return direct.value
+  const withoutGutter = stripCodeGutter(trimmed)
+  if (withoutGutter !== trimmed) {
+    const stripped = tryParse(withoutGutter)
+    if (stripped.ok) return stripped.value
+  }
   const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)
   if (fence) {
     const fenced = tryParse(fence[1].trim())
@@ -44,9 +49,44 @@ export function repairJson(text: string): { ok: true; value: unknown } | { ok: f
   }
 }
 
+export function stripCodeGutter(text: string): string {
+  const lines = text.replace(/\u00a0/g, ' ').split('\n')
+  let index = 0
+  while (index < lines.length && !lines[index].trim()) index += 1
+  if (/^(json|javascript|js|ts|txt|text)$/i.test(lines[index]?.trim() ?? '')) index += 1
+  const numbersAt = index
+  while (index < lines.length && /^\d+$/.test(lines[index].trim())) index += 1
+  if (index - numbersAt < 3) return text.trim()
+  return lines.slice(index).join('\n').trim()
+}
+
+export function stitchChunks(chunks: string[]): string {
+  let acc: string[] = []
+  for (const chunk of chunks) {
+    const next = chunk.split('\n')
+    if (!acc.length) {
+      acc = next
+      continue
+    }
+    let overlap = 0
+    const limit = Math.min(acc.length, next.length)
+    for (let size = limit; size > 0; size -= 1) {
+      const same = acc.slice(-size).every((line, index) => line.trim() === next[index]?.trim())
+      if (same) {
+        overlap = size
+        break
+      }
+    }
+    acc = acc.concat(next.slice(overlap))
+  }
+  return acc.join('\n')
+}
+
 function jsonCandidates(text: string): string[] {
   const trimmed = text.trim().replace(/^\uFEFF/, '')
   const list = [trimmed]
+  const withoutGutter = stripCodeGutter(trimmed)
+  if (withoutGutter !== trimmed) list.push(withoutGutter)
   const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)
   if (fence?.[1]) list.push(fence[1].trim())
   const extras: string[] = []

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { layoutRun, nodeSize } from '@core/run-layout'
-import type { Branch, RunDetails, StepDefinition } from '@core/types'
+import type { Branch, RunDetails, StepDefinition, StepExecution } from '@core/types'
 
 function step(partial: Partial<StepDefinition> & Pick<StepDefinition, 'id' | 'key' | 'type' | 'config'>): StepDefinition {
   return {
@@ -173,6 +173,141 @@ describe('run layout', () => {
     assert.equal(shots[0].y, shots[1].y)
     assert.equal(shots[0].status, 'pending')
     assert.ok(shots[1].x >= shots[0].x + shots[0].w)
+  })
+
+  it('keeps a step that depends on the step before a nested branch outside that branch', () => {
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        name: 'Элемент концепции',
+        type: 'fanout',
+        order: 1,
+        iterate: { over: '{{steps.prep.output}}', alias: 'concept', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'look',
+        key: 'ai_create_look_by_concept',
+        name: 'Лук по концепции',
+        type: 'ai',
+        order: 2,
+        dependsOn: ['concepts'],
+        config: { provider: 'qwen', model: 'qwen', messages: [], outputFormat: 'text' }
+      }),
+      step({
+        id: 'shots',
+        key: 'shots',
+        name: 'Шоты концепции',
+        type: 'fanout',
+        order: 3,
+        dependsOn: ['look'],
+        iterate: { over: '{{steps.look.output}}', alias: 'shot', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'comment',
+        key: 'comment_to_concept_shot',
+        name: 'Комментарий к шоту концепции',
+        type: 'manual',
+        order: 4,
+        dependsOn: ['look'],
+        config: { mode: 'text', prompt: '' }
+      }),
+      step({
+        id: 'next',
+        key: 'next',
+        name: 'Следующий шаг концепции',
+        type: 'transform',
+        order: 5,
+        dependsOn: ['comment'],
+        config: { mode: 'template', template: '' }
+      })
+    ]
+    const laid = layoutRun(
+      details(steps, [branch({ id: 'c0', parentBranchId: '', sourceStepId: 'concepts', itemIndex: 0, label: 'Город' })])
+    )
+    const look = laid.nodes.find((node) => node.stepId === 'look')
+    const comment = laid.nodes.find((node) => node.stepId === 'comment')
+    const next = laid.nodes.find((node) => node.stepId === 'next')
+    const shots = laid.nodes.find((node) => node.role === 'split' && node.stepId === 'shots')
+    assert.ok(look && comment && next && shots)
+    assert.equal(comment.branchId, 'c0')
+    assert.equal(next.branchId, 'c0')
+    assert.equal(laid.nodes.filter((node) => node.stepId === 'comment').length, 1)
+    assert.equal(laid.nodes.filter((node) => node.stepId === 'next').length, 1)
+    assert.ok(comment.y > look.y)
+    assert.ok(next.y > comment.y)
+  })
+
+  it('shows a result that was saved inside a nested branch on the outer step', () => {
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        name: 'Элемент концепции',
+        type: 'fanout',
+        order: 1,
+        iterate: { over: '{{steps.prep.output}}', alias: 'concept', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'look',
+        key: 'look',
+        name: 'Лук',
+        type: 'transform',
+        order: 2,
+        dependsOn: ['concepts'],
+        config: { mode: 'template', template: '' }
+      }),
+      step({
+        id: 'shots',
+        key: 'shots',
+        name: 'Элемент лука',
+        type: 'fanout',
+        order: 3,
+        dependsOn: ['look'],
+        iterate: { over: '{{steps.look.output}}', alias: 'shot', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'comment',
+        key: 'comment',
+        name: 'Формирование шотов по концепции',
+        type: 'ai',
+        order: 4,
+        dependsOn: ['look'],
+        config: { provider: 'qwen', model: 'qwen', messages: [], outputFormat: 'text' }
+      })
+    ]
+    const data = details(steps, [
+      branch({ id: 'c0', parentBranchId: '', sourceStepId: 'concepts', itemIndex: 0, label: 'Город' }),
+      branch({ id: 'l0', parentBranchId: 'c0', sourceStepId: 'shots', itemIndex: 0, label: 'Лук' })
+    ])
+    data.executions = [
+      {
+        id: 'exec',
+        runId: 'run',
+        stepId: 'comment',
+        branchId: 'l0',
+        attempt: 1,
+        status: 'failed',
+        request: null,
+        rawResponse: 'ответ',
+        parsed: null,
+        error: 'Ответ не содержит корректный JSON',
+        startedAt: '2026-10-17T11:44:27.256Z',
+        finishedAt: '2026-10-17T11:47:00.935Z',
+        durationMs: 1,
+        meta: {},
+        createdAt: '2026-10-17T11:44:27.256Z'
+      } as StepExecution
+    ]
+    const laid = layoutRun(data)
+    const comment = laid.nodes.find((node) => node.stepId === 'comment')
+    assert.ok(comment)
+    assert.equal(comment.branchId, 'c0')
+    assert.equal(comment.status, 'failed')
   })
 
   it('places a later batch under the existing items', () => {

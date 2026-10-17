@@ -321,6 +321,7 @@ export type ExecutionMeta = {
   model?: string
   provider?: string
   repairedJson?: boolean
+  manualAnswer?: boolean
 }
 
 export type StepOutcome = {
@@ -398,11 +399,11 @@ export type RunDetails = {
 export type UserActionPayload =
   | { type: 'select_one'; optionId: string }
   | { type: 'select_many'; optionIds: string[] }
-  | { type: 'text'; text: string }
+  | { type: 'text'; text: string; files?: StoredFile[] }
   | { type: 'confirm'; accepted: boolean }
   | { type: 'skip' }
   | { type: 'edit_json'; value: unknown }
-  | { type: 'upload'; file: StoredFile }
+  | { type: 'upload'; file?: StoredFile; files?: StoredFile[] }
 
 export type ContentPart =
   | { type: 'text'; text: string }

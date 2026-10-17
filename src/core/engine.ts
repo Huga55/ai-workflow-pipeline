@@ -1,4 +1,4 @@
-import { repairJson, validateJsonSchema } from '@core/json'
+import { extractJson, repairJson, validateJsonSchema } from '@core/json'
 import { inferKind } from '@core/labels'
 import { branchLabel } from '@core/labels'
 import { chainStepIds, fanoutInnerSteps, hiddenDescendantIds, isCollectMerge, topoSort } from '@core/graph'
@@ -193,6 +193,52 @@ export class WorkflowEngine {
     if (branch?.status === 'failed') this.setBranchStatus(options.runId, branchId, 'paused')
     options.onProgress?.()
     return 'paused'
+  }
+
+  async acceptManualAnswer(
+    options: AdvanceOptions,
+    stepId: string,
+    branchId: string,
+    text: string,
+    continueAfter = false
+  ): Promise<AdvanceResult> {
+    const step = options.graph.steps.find((item) => item.id === stepId)
+    if (!step) throw new Error('Шаг не найден')
+    if (step.type === 'fanout' || step.type === 'input') throw new Error('В этот шаг ответ вручную не записывается')
+    const output = manualAnswerValue(step, text)
+    const existing = this.effectiveExecution(options.runId, stepId, branchId)
+    const started = nowIso()
+    const execution: StepExecution = {
+      id: createId(),
+      runId: options.runId,
+      stepId,
+      branchId,
+      attempt: (existing?.attempt ?? 0) + 1,
+      status: 'completed',
+      request: null,
+      rawResponse: text,
+      parsed: output,
+      error: null,
+      startedAt: started,
+      finishedAt: started,
+      durationMs: 0,
+      meta: { manualAnswer: true },
+      createdAt: started
+    }
+    this.store.insertExecution(execution)
+    this.store.insertArtifact(this.artifact(options.runId, execution.id, output))
+    const branch = branchId ? this.store.listBranches(options.runId).find((item) => item.id === branchId) : undefined
+    if (branch && (branch.status === 'failed' || branch.status === 'running')) this.setBranchStatus(options.runId, branchId, 'paused')
+    options.onProgress?.()
+    if (!continueAfter) return 'paused'
+    const allow = chainStepIds(stepId, options.graph.steps)
+    allow.delete(stepId)
+    return this.advanceScope(this.rootScope(options.runId), options.graph.steps, {
+      ...options,
+      allowStepIds: allow,
+      forceStepIds: allow,
+      onlyBranchId: branchId || undefined
+    })
   }
 
   private markSkipped(options: AdvanceOptions, stepId: string, branchId: string, output: unknown): void {
@@ -888,6 +934,24 @@ function sideIdsInScope(steps: StepDefinition[], local: StepDefinition[]): Set<s
     }
   }
   return ids
+}
+
+function manualAnswerValue(step: StepDefinition, text: string): unknown {
+  const trimmed = text.trim()
+  if (!trimmed) throw new Error('Вставьте ответ')
+  const wantsJson = (step.type === 'ai' && step.config.outputFormat === 'json') || step.type === 'parse'
+  if (!wantsJson) return trimmed
+  let value: unknown
+  try {
+    value = extractJson(trimmed)
+  } catch {
+    throw new Error('Это не JSON. Вставьте объект или массив целиком.')
+  }
+  if (step.type === 'ai' && step.config.outputFormat === 'json' && step.config.jsonSchema) {
+    const check = validateJsonSchema(step.config.jsonSchema, value)
+    if (!check.ok) throw new Error(`JSON разобрался, но схема не сошлась:\n${check.error}`)
+  }
+  return value
 }
 
 function mergeAdvance(left: AdvanceResult, right: AdvanceResult): AdvanceResult {

@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react'
 import { chainStepIds } from '@core/graph'
+import { stepExecution } from '@core/run-layout'
 import { pretty } from '@core/labels'
-import { isStoredFile, toMediaUrl } from '@core/media'
+import { storedFiles } from '@core/media'
 import { runVersionFit, type RunVersionFit } from '@core/run-version'
 import type { RunDetails, StepDefinition, StepExecution, StoredFile, UserActionPayload } from '@core/types'
+import { MediaPicker, attachmentsFromTransfer, type MediaAccept } from '../media-field'
 import { RunCanvas, type CanvasNode } from '../run-canvas'
-import { copyText, errorText, JsonView, Modal, StatusPill, whenText } from '../ui'
+import { clipboardHasFiles, copyText, errorText, JsonView, Modal, StatusPill, whenText } from '../ui'
 
 export function RunPage({
   runId,
@@ -356,36 +358,17 @@ function InputControl({
   }
   if (type === 'image' || type === 'file' || type === 'image[]' || type === 'file[]') {
     const multiple = type.endsWith('[]')
-    const kind = type.startsWith('image') ? 'image' : 'file'
-    const files = multiple ? (Array.isArray(value) ? value : []) : value ? [value] : []
+    const accept: MediaAccept = type.startsWith('image') ? 'image' : 'file'
     return (
       <div className="field">
         <span>{title}</span>
         {description && <span>{description}</span>}
-        <div className="row">
-          {files.map((file) =>
-            isStoredFile(file, 'image') ? (
-              <img key={(file as StoredFile).path} className="preview" alt={(file as StoredFile).name} src={toMediaUrl((file as StoredFile).path)} />
-            ) : (
-              <span key={(file as StoredFile).path} className="meta">
-                {(file as StoredFile).name}
-              </span>
-            )
-          )}
-        </div>
-        <button
-          className="ghost"
-          type="button"
+        <MediaPicker
+          accept={accept}
+          files={storedFiles(value)}
           disabled={disabled}
-          onClick={() => {
-            void window.pipeline.pickFiles(kind, multiple).then((picked) => {
-              if (!picked.length) return
-              onChange(multiple ? [...files, ...picked] : picked[0])
-            })
-          }}
-        >
-          Выбрать файл
-        </button>
+          onChange={(next) => onChange(storedValue(multiple, next))}
+        />
       </div>
     )
   }
@@ -396,6 +379,13 @@ function InputControl({
       {description && <span>{description}</span>}
     </label>
   )
+}
+
+function storedValue(multiple: boolean, files: StoredFile[]): unknown {
+  if (multiple) return files
+  if (files.length === 0) return null
+  if (files.length === 1) return files[0]
+  return files
 }
 
 function chatIdFromUrl(url: string | null | undefined): string | null {
@@ -549,8 +539,9 @@ function ExecutionCard({
   act: (work: () => Promise<RunDetails>) => Promise<void>
   notify: (message: string) => void
 }) {
+  const resolved = stepExecution(details, step.id, branchId)
   const attempts = details.executions
-    .filter((item) => item.stepId === step.id && item.branchId === branchId)
+    .filter((item) => item.stepId === step.id && item.branchId === (resolved?.branchId ?? branchId))
     .sort((a, b) => b.attempt - a.attempt)
   const [attemptId, setAttemptId] = useState<string | null>(null)
   const execution = attempts.find((item) => item.id === attemptId) ?? attempts[0]
@@ -580,6 +571,7 @@ function ExecutionCard({
         {execution.durationMs != null ? ` · ${execution.durationMs} мс` : ''}
         {execution.meta.provider ? ` · ${execution.meta.provider} / ${execution.meta.model ?? ''}` : ''}
         {execution.meta.repairedJson ? ' · JSON починен из сырого ответа' : ''}
+        {execution.meta.manualAnswer ? ' · ответ введён вручную' : ''}
       </p>
       {attempts.length > 1 && (
         <div className="attempts">
@@ -593,6 +585,7 @@ function ExecutionCard({
       {execution.error && <div className="error">{execution.error}</div>}
       {execution.status === 'waiting_for_user' && execution.meta.waiting && (
         <ManualForm
+          key={execution.id}
           details={details}
           execution={execution}
           busy={busy}
@@ -652,15 +645,16 @@ function RunActions({
   act: (work: () => Promise<RunDetails>) => Promise<void>
 }) {
   const [appendBatch, setAppendBatch] = useState(false)
+  const [answerOpen, setAnswerOpen] = useState(false)
+  const [answerText, setAnswerText] = useState('')
   if (details.run.status === 'running') return null
-  const latest = details.executions
-    .filter((item) => item.stepId === step.id && item.branchId === branchId && !item.meta.fanoutError)
-    .sort((a, b) => b.attempt - a.attempt)[0]
+  const latest = stepExecution(details, step.id, branchId)
   const canSkip = !latest || (latest.status !== 'completed' && latest.status !== 'skipped' && latest.status !== 'running' && latest.status !== 'waiting_for_user')
   const canRepair = latest?.status === 'failed' && Boolean(latest.rawResponse) && (latest.error ?? '').includes('корректный JSON')
   const chain = chainStepIds(step.id, details.graph.steps)
   const canAppend = details.graph.steps.some((item) => item.iterate && chain.has(item.id))
   const forcedAppend = details.graph.steps.some((item) => item.iterate?.appendOnRerun && chain.has(item.id))
+  const canPasteAnswer = step.type !== 'fanout' && step.type !== 'input'
   const runAgain = (mode: 'only' | 'chain') =>
     window.pipeline.runStep(
       details.run.id,
@@ -669,6 +663,12 @@ function RunActions({
       mode,
       appendBatch || forcedAppend ? { appendBatch: true } : undefined
     )
+  const saveAnswer = (continueAfter: boolean) => {
+    if (typeof window.pipeline.acceptManualAnswer !== 'function') {
+      return Promise.reject(new Error('Закройте приложение полностью и запустите снова. Обновление окна эту кнопку не подключает.'))
+    }
+    return window.pipeline.acceptManualAnswer(details.run.id, step.id, branchId, answerText, continueAfter)
+  }
   return (
     <>
       {canAppend && !forcedAppend && (
@@ -697,13 +697,40 @@ function RunActions({
                       new Error('Закройте приложение полностью и запустите снова. Обновление окна эту кнопку не подключает.')
                     )
                   }
-                  return window.pipeline.repairStepJson(details.run.id, step.id, branchId)
+                  return window.pipeline.repairStepJson(details.run.id, step.id, latest?.branchId ?? branchId)
                 })
               }
             >
               Починить JSON
             </button>
           </div>
+        </>
+      )}
+      {canPasteAnswer && (
+        <>
+          <div className="row">
+            <button className="ghost" type="button" disabled={busy} onClick={() => setAnswerOpen((open) => !open)}>
+              Добавить ответ вручную
+            </button>
+          </div>
+          {answerOpen && (
+            <label className="field">
+              <span>Ответ</span>
+              <textarea value={answerText} onChange={(event) => setAnswerText(event.target.value)} />
+              <p className="field-note">
+                Модель не вызывается. Если шаг ждёт JSON, вставьте объект или массив целиком. «Сохранить и продолжить» идёт к
+                следующим шагам с этим ответом и заново его не запрашивает.
+              </p>
+              <div className="row">
+                <button className="btn" type="button" disabled={busy || !answerText.trim()} onClick={() => void act(() => saveAnswer(true))}>
+                  Сохранить и продолжить
+                </button>
+                <button className="ghost" type="button" disabled={busy || !answerText.trim()} onClick={() => void act(() => saveAnswer(false))}>
+                  Только сохранить
+                </button>
+              </div>
+            </label>
+          )}
         </>
       )}
       <div className="row">
@@ -762,6 +789,7 @@ function ManualForm({
   const [optionId, setOptionId] = useState('')
   const [optionIds, setOptionIds] = useState<string[]>([])
   const [text, setText] = useState('')
+  const [files, setFiles] = useState<StoredFile[]>([])
   const [jsonText, setJsonText] = useState(waiting?.value != null ? JSON.stringify(waiting.value, null, 2) : '')
   if (!waiting) return null
   if (waiting.mode === 'select_one' || waiting.mode === 'select_many') {
@@ -799,8 +827,17 @@ function ManualForm({
     )
   }
   if (waiting.mode === 'text') {
+    const empty = !text.trim() && files.length === 0
     return (
-      <div>
+      <div
+        onPaste={(event) => {
+          if (!clipboardHasFiles(event.clipboardData)) return
+          event.preventDefault()
+          void attachmentsFromTransfer(event.clipboardData, 'any').then((picked) => {
+            if (picked.length) setFiles((current) => [...current, ...picked])
+          })
+        }}
+      >
         {waiting.value != null && (
           <div>
             <p className="meta">Ответ, который нужно проверить</p>
@@ -811,9 +848,15 @@ function ManualForm({
           <span>{waiting.prompt}</span>
           <textarea rows={8} value={text} onChange={(event) => setText(event.target.value)} />
         </label>
+        <MediaPicker accept="any" files={files} disabled={busy} onChange={setFiles} />
         <div className="row">
-          <button className="btn" type="button" disabled={busy || (!waiting.allowEmpty && !text.trim())} onClick={() => onSubmit({ type: 'text', text })}>
-            {waiting.allowEmpty && !text.trim() ? 'Продолжить без текста' : 'Сохранить текст'}
+          <button
+            className="btn"
+            type="button"
+            disabled={busy || (!waiting.allowEmpty && empty)}
+            onClick={() => onSubmit({ type: 'text', text, files })}
+          >
+            {waiting.allowEmpty && empty ? 'Продолжить без текста' : 'Сохранить'}
           </button>
           <SkipFollowup details={details} waiting={waiting} busy={busy} onSubmit={onSubmit} />
         </div>
@@ -847,18 +890,19 @@ function ManualForm({
       </div>
     )
   }
+  const accept: MediaAccept = waiting.mode === 'upload_image' ? 'image' : 'file'
   return (
-    <button
-      className="ghost"
-      type="button"
-      disabled={busy}
-      onClick={() => {
-        void window.pipeline.pickFiles(waiting.mode === 'upload_image' ? 'image' : 'file', false).then((files) => {
-          if (files[0]) onSubmit({ type: 'upload', file: files[0] })
-        })
-      }}
-    >
-      {waiting.prompt || 'Загрузить'}
-    </button>
+    <div>
+      {waiting.prompt && <p>{waiting.prompt}</p>}
+      <MediaPicker accept={accept} files={files} disabled={busy} onChange={setFiles} />
+      <button
+        className="btn"
+        type="button"
+        disabled={busy || (!waiting.allowEmpty && files.length === 0)}
+        onClick={() => onSubmit({ type: 'upload', files })}
+      >
+        {waiting.allowEmpty && files.length === 0 ? 'Продолжить без файла' : 'Сохранить'}
+      </button>
+    </div>
   )
 }

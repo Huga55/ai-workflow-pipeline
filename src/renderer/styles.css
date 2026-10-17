@@ -420,6 +420,10 @@ textarea.json-editor:focus { border-color: var(--brass-deep); }
 }
 .choice { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-bottom: 1px solid var(--line); }
 .preview { width: 120px; height: 120px; object-fit: cover; border-radius: 12px; border: 1px solid var(--line); }
+.media-picker { display: flex; flex-direction: column; gap: 8px; border-radius: 12px; }
+.media-picker:focus-visible { outline: 1px solid var(--brass-deep); outline-offset: 2px; }
+.media-item { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; max-width: 160px; }
+.media-item .meta { word-break: break-word; }
 .picker { position: relative; }
 .picker-panel {
   position: absolute;

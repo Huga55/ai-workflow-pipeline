@@ -47,6 +47,7 @@ export function fanoutInnerSteps(stepId: string, steps: StepDefinition[]): StepD
   const chains = sideChains(steps)
   const sideIds = new Set(chains.flatMap((chain) => chain.stepIds))
   const ordered = [...steps].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name))
+  const keptOut = new Set<string>()
   let after = false
   for (const step of ordered) {
     if (step.id === stepId) {
@@ -58,6 +59,10 @@ export function fanoutInnerSteps(stepId: string, steps: StepDefinition[]): StepD
       const targetId = step.config.fromFanoutStepId
       if (targetId === stepId || upstream.has(targetId)) break
     }
+    if (step.dependsOn.some((dep) => keptOut.has(dep) || placedInAncestorFanout(dep, stepId, steps))) {
+      keptOut.add(step.id)
+      continue
+    }
     owned.add(step.id)
   }
   for (const chain of chains) {
@@ -66,6 +71,28 @@ export function fanoutInnerSteps(stepId: string, steps: StepDefinition[]): StepD
     for (const id of chain.stepIds) owned.add(id)
   }
   return steps.filter((step) => owned.has(step.id))
+}
+
+function placedInAncestorFanout(depId: string, fanoutId: string, steps: StepDefinition[]): boolean {
+  const ancestors = ancestorIds(fanoutId, steps)
+  for (const fanout of steps) {
+    if (!fanout.iterate || fanout.id === fanoutId || !ancestors.has(fanout.id)) continue
+    if (innerDependents(fanout.id, steps).some((inner) => inner.id === depId)) return true
+  }
+  return false
+}
+
+function belongsToEarlierNestedFanout(stepId: string, originId: string, steps: StepDefinition[]): boolean {
+  const origin = steps.find((step) => step.id === originId)
+  if (!origin) return false
+  for (const fanout of steps) {
+    if (!fanout.iterate || fanout.id === originId || fanout.order >= origin.order) continue
+    const inner = fanoutInnerSteps(fanout.id, steps)
+    if (!inner.some((item) => item.id === stepId)) continue
+    if (fanout.id === originId || inner.some((item) => item.id === originId)) continue
+    return true
+  }
+  return false
 }
 
 function ancestorIds(stepId: string, steps: StepDefinition[]): Set<string> {
@@ -138,7 +165,8 @@ export function chainStepIds(stepId: string, steps: StepDefinition[]): Set<strin
   for (const owner of owners) {
     if (owner.id === origin.id) continue
     for (const step of fanoutInnerSteps(owner.id, steps)) {
-      if (later(step)) add(step.id)
+      if (!later(step) || belongsToEarlierNestedFanout(step.id, origin.id, steps)) continue
+      add(step.id)
     }
     for (const step of steps) {
       if (hidden.has(step.id) || step.order <= owner.order || upstream.has(step.id)) continue

@@ -1,4 +1,4 @@
-import { isStoredFile } from '@core/media'
+import { isStoredFile, isTextWithFiles, textWithFilesDisplay } from '@core/media'
 import { effectiveStep } from '@core/step-ref'
 import type { ContentPart, NamedVariable, VariableContext, VariableVersion, WorkflowGraph, StepDefinition } from '@core/types'
 
@@ -308,6 +308,15 @@ export function interpolateParts(template: string, ctx: VariableContext): Conten
       parts.push({ type: 'image', path: image.path, mime: image.mime, name: image.name })
       return
     }
+    if (isTextWithFiles(value)) {
+      const names = value.files.filter((file) => file.kind === 'file').map((file) => file.name)
+      const text = names.length ? (value.text ? `${value.text}\n${names.join('\n')}` : names.join('\n')) : value.text
+      pushText(text)
+      value.files.forEach((file) => {
+        if (file.kind === 'image') append(file)
+      })
+      return
+    }
     if (Array.isArray(value)) {
       value.forEach(append)
       return
@@ -357,7 +366,7 @@ function renderText(nodes: TemplateNode[], ctx: VariableContext, depth: number):
         if (depth < SNIPPET_DEPTH) out += renderText(parseTemplate(resolved.value), ctx, depth + 1)
         continue
       }
-      out += stringifyValue(resolved.value)
+      out += isTextWithFiles(resolved.value) ? textWithFilesDisplay(resolved.value) : stringifyValue(resolved.value)
       continue
     }
     if (isPresent(conditionValue(node.path, ctx))) out += renderText(node.children, ctx, depth)

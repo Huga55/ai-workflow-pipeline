@@ -1,4 +1,5 @@
-import type { ManualWaiting, StepOutcome, UserActionPayload } from '@core/types'
+import { isStoredFile, storedFiles } from '@core/media'
+import type { ManualWaiting, StepOutcome, StoredFile, UserActionPayload } from '@core/types'
 
 export function applyManualAction(
   waiting: ManualWaiting,
@@ -19,8 +20,10 @@ export function applyManualAction(
   }
   if (payload.type === 'text') {
     if (waiting.mode !== 'text') return { ok: false, error: 'Этот шаг не ожидает текст' }
-    if (!payload.text.trim() && !waiting.allowEmpty) return { ok: false, error: 'Введите текст' }
-    return { ok: true, output: payload.text }
+    const files = storedFiles(payload.files ?? [])
+    if (!payload.text.trim() && files.length === 0 && !waiting.allowEmpty) return { ok: false, error: 'Введите текст' }
+    if (!files.length) return { ok: true, output: payload.text }
+    return { ok: true, output: { text: payload.text, files } }
   }
   if (payload.type === 'confirm') {
     if (waiting.mode !== 'confirm') return { ok: false, error: 'Этот шаг не ожидает подтверждение' }
@@ -34,10 +37,19 @@ export function applyManualAction(
   if (payload.type === 'upload') {
     const expected = waiting.mode === 'upload_image' ? 'image' : waiting.mode === 'upload_file' ? 'file' : null
     if (!expected) return { ok: false, error: 'Этот шаг не ожидает файл' }
-    if (payload.file.kind !== expected) return { ok: false, error: 'Неверный тип файла' }
-    return { ok: true, output: payload.file }
+    const files = uploadFiles(payload)
+    if (!files.length) {
+      if (waiting.allowEmpty) return { ok: true, output: null }
+      return { ok: false, error: 'Добавьте файл' }
+    }
+    if (files.some((file) => !isStoredFile(file, expected))) return { ok: false, error: 'Неверный тип файла' }
+    return { ok: true, output: files.length === 1 ? files[0] : files }
   }
   return { ok: false, error: 'Неизвестное действие' }
+}
+
+function uploadFiles(payload: { file?: StoredFile; files?: StoredFile[] }): StoredFile[] {
+  return storedFiles(payload.files?.length ? payload.files : payload.file)
 }
 
 export function waitingOutcome(waiting: ManualWaiting, request: unknown): StepOutcome {

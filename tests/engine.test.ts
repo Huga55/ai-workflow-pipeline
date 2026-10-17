@@ -3,7 +3,7 @@ import { describe, it } from 'node:test'
 import { runAiStep } from '@core/ai-step'
 import { WorkflowEngine } from '@core/engine'
 import { validateGraph } from '@core/graph'
-import { extractJson, repairJson, validateJsonSchema } from '@core/json'
+import { extractJson, repairJson, stitchChunks, stripCodeGutter, validateJsonSchema } from '@core/json'
 import { MemoryStore } from '@core/memory-store'
 import { createRunners } from '@core/runners'
 import { createNeurophotoGraph } from '@core/template'
@@ -229,6 +229,17 @@ describe('json', () => {
     if (repaired.ok) expect(repaired.value).toEqual({ title: 'say "hi"' })
   })
 
+  it('reads json after a code gutter of line numbers', () => {
+    const parsed = extractJson('json\n191\n192\n193\n{"shots":[{"shotNumber":"SHOT 01"}]}')
+    expect(parsed).toEqual({ shots: [{ shotNumber: 'SHOT 01' }] })
+    expect(stripCodeGutter('{"shots":[]}')).toBe('{"shots":[]}')
+  })
+
+  it('joins overlapping slices of a scrolled code block', () => {
+    const text = stitchChunks(['{\n  "a": 1,\n  "b": 2,', '  "b": 2,\n  "c": 3\n}'])
+    expect(extractJson(text)).toEqual({ a: 1, b: 2, c: 3 })
+  })
+
   it('does not throw when the json cannot be repaired', () => {
     const truncated = repairJson('{"a": "hi"')
     expect(truncated.ok).toBe(false)
@@ -287,6 +298,51 @@ describe('json repair on a step', () => {
     const used = store.executions.find((item) => item.stepId === 'use' && item.status === 'completed')
     const artifact = store.artifacts.find((item) => item.stepExecutionId === used?.id)
     expect(artifact?.value).toBe('клише "строгой офисной дамы"')
+  })
+
+  it('stores a pasted answer and continues without another model call', async () => {
+    const store = new MemoryStore()
+    let calls = 0
+    const engine = new WorkflowEngine(
+      store,
+      createRunners({
+        generate: async () => {
+          calls += 1
+          return { raw: 'не нужно', providerResponse: null, model: 'test', provider: 'test' }
+        }
+      })
+    )
+    const steps = [
+      step({
+        id: 'ask',
+        key: 'ask',
+        type: 'ai',
+        order: 1,
+        config: {
+          provider: 'openai',
+          model: 'test',
+          messages: [{ id: 'm', role: 'user', content: 'дай json' }],
+          outputFormat: 'json'
+        }
+      }),
+      step({
+        id: 'use',
+        key: 'use',
+        type: 'transform',
+        order: 2,
+        dependsOn: ['ask'],
+        config: { mode: 'template', template: '{{steps.ask.output.title}}' }
+      })
+    ]
+    const options = { runId: 'run', graph: graph(steps), inputs: {} }
+    expect(await engine.acceptManualAnswer(options, 'ask', '', '{"title":"Город"}', true)).toBe('completed')
+    expect(calls).toBe(0)
+    const saved = store.executions.find((item) => item.stepId === 'ask' && item.status === 'completed')
+    expect(saved?.meta.manualAnswer).toBe(true)
+    expect(store.artifacts.find((item) => item.stepExecutionId === saved?.id)?.value).toEqual({ title: 'Город' })
+    const used = store.executions.find((item) => item.stepId === 'use' && item.status === 'completed')
+    expect(store.artifacts.find((item) => item.stepExecutionId === used?.id)?.value).toBe('Город')
+    await assert.rejects(() => engine.acceptManualAnswer(options, 'ask', '', 'не json', false), /Это не JSON/)
   })
 
   it('keeps the failed step when the answer cannot be repaired', async () => {
@@ -770,6 +826,83 @@ describe('engine', () => {
     expect(store.artifacts.find((item) => item.stepExecutionId === latest?.id)?.value).toBe('A-shot')
   })
 
+  it('continues the outer branch when a nested fanout before the step has no items', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'item', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'look',
+        key: 'look',
+        type: 'transform',
+        order: 3,
+        dependsOn: ['items'],
+        config: { mode: 'template', template: '{{item.title}}' }
+      }),
+      step({
+        id: 'shots',
+        key: 'shots',
+        type: 'fanout',
+        order: 4,
+        dependsOn: ['look'],
+        iterate: { over: '{{steps.look.output.shots}}', alias: 'shot', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'comment',
+        key: 'comment',
+        type: 'transform',
+        order: 5,
+        dependsOn: ['look'],
+        config: { mode: 'template', template: 'note {{steps.look.output}}' }
+      }),
+      step({
+        id: 'next',
+        key: 'next',
+        type: 'transform',
+        order: 6,
+        dependsOn: ['comment'],
+        config: { mode: 'template', template: '{{steps.comment.output}}-next' }
+      }),
+      step({
+        id: 'shot_note',
+        key: 'shot_note',
+        type: 'transform',
+        order: 7,
+        dependsOn: ['shots'],
+        config: { mode: 'template', template: 'shot' }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('failed')
+    const branch = store.branches.find((item) => item.sourceStepId === 'items')
+    expect(branch).toBeTruthy()
+    expect(
+      await run(engine, store, steps, { focus: { stepId: 'comment', branchId: branch?.id ?? '', mode: 'chain' } })
+    ).toBe('completed')
+    const done = (stepId: string, branchId: string) =>
+      store.executions.filter((item) => item.stepId === stepId && item.branchId === branchId && item.status === 'completed')
+    expect(done('comment', branch?.id ?? '')).toHaveLength(1)
+    expect(done('next', branch?.id ?? '')).toHaveLength(1)
+    expect(done('shot_note', branch?.id ?? '')).toHaveLength(0)
+    expect(store.branches.some((item) => item.sourceStepId === 'shots')).toBe(false)
+    expect(store.artifacts.find((item) => item.stepExecutionId === done('next', branch?.id ?? '')[0]?.id)?.value).toBe('note A-next')
+  })
+
   it('does not rerun an earlier manual step when the parse is listed after the fanout', async () => {
     const store = new MemoryStore()
     const engine = new WorkflowEngine(store)
@@ -835,6 +968,59 @@ describe('engine', () => {
       { type: 'text', text: '   ' }
     )
     expect(result).toEqual({ ok: true, output: '   ' })
+  })
+
+  it('keeps manual text as a string until files are attached', () => {
+    const image = { kind: 'image' as const, path: '/tmp/a.png', mime: 'image/png', name: 'a.png' }
+    const file = { kind: 'file' as const, path: '/tmp/a.pdf', mime: 'application/pdf', name: 'a.pdf' }
+    expect(applyManualAction({ mode: 'text', prompt: '' }, { type: 'text', text: 'смотри' })).toEqual({
+      ok: true,
+      output: 'смотри'
+    })
+    expect(
+      applyManualAction({ mode: 'text', prompt: '' }, { type: 'text', text: 'смотри', files: [image, file] })
+    ).toEqual({ ok: true, output: { text: 'смотри', files: [image, file] } })
+    expect(applyManualAction({ mode: 'text', prompt: '' }, { type: 'text', text: '   ', files: [image] })).toEqual({
+      ok: true,
+      output: { text: '   ', files: [image] }
+    })
+  })
+
+  it('keeps one uploaded file as a file and several as a list', () => {
+    const first = { kind: 'image' as const, path: '/tmp/a.png', mime: 'image/png', name: 'a.png' }
+    const second = { kind: 'image' as const, path: '/tmp/b.png', mime: 'image/png', name: 'b.png' }
+    expect(applyManualAction({ mode: 'upload_image', prompt: '' }, { type: 'upload', files: [first] })).toEqual({
+      ok: true,
+      output: first
+    })
+    expect(applyManualAction({ mode: 'upload_image', prompt: '' }, { type: 'upload', files: [first, second] })).toEqual({
+      ok: true,
+      output: [first, second]
+    })
+    expect(applyManualAction({ mode: 'upload_image', prompt: '', allowEmpty: true }, { type: 'upload', files: [] })).toEqual({
+      ok: true,
+      output: null
+    })
+  })
+
+  it('sends a manual note with files as text and images', () => {
+    const image = { kind: 'image' as const, path: '/tmp/a.png', mime: 'image/png', name: 'a.png' }
+    const file = { kind: 'file' as const, path: '/tmp/a.pdf', mime: 'application/pdf', name: 'a.pdf' }
+    expect(
+      interpolateParts('{{steps.note.output}}', {
+        inputs: {},
+        steps: { note: { output: { text: 'смотри', files: [image, file] } } },
+        aliases: {}
+      })
+    ).toEqual([
+      { type: 'text', text: 'смотри\na.pdf' },
+      { type: 'image', path: '/tmp/a.png', mime: 'image/png', name: 'a.png' }
+    ])
+    expect(interpolate('Заметка: {{steps.note.output}}', {
+      inputs: {},
+      steps: { note: { output: { text: 'смотри', files: [image, file] } } },
+      aliases: {}
+    })).toBe('Заметка: смотри\na.png\na.pdf')
   })
 
   it('runs every item and can resume a single manual branch', async () => {

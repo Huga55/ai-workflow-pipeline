@@ -69,11 +69,12 @@ export function formatWorkflowJson(document: WorkflowJsonDocument): string {
   payload.inputs = document.graph.inputs
   if (document.graph.snippets?.length) payload.snippets = document.graph.snippets
   if (document.graph.chats?.length) payload.chats = document.graph.chats
-  payload.steps = document.graph.steps.map(formatStep)
+  const keyById = new Map(document.graph.steps.map((step) => [step.id, step.key]))
+  payload.steps = document.graph.steps.map((step) => formatStep(step, keyById))
   return JSON.stringify(payload, null, 2)
 }
 
-function formatStep(step: StepDefinition): Record<string, unknown> {
+function formatStep(step: StepDefinition, keyById: Map<string, string>): Record<string, unknown> {
   const out: Record<string, unknown> = {
     id: step.id,
     key: step.key,
@@ -81,7 +82,7 @@ function formatStep(step: StepDefinition): Record<string, unknown> {
     description: step.description,
     type: step.type,
     order: step.order,
-    dependsOn: step.dependsOn,
+    dependsOn: step.dependsOn.map((id) => keyById.get(id) ?? id),
     stopAfter: step.stopAfter,
     iterate: step.iterate
   }
