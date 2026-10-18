@@ -5,6 +5,7 @@ import type {
   Branch,
   NamedVariable,
   Run,
+  RunChatStatus,
   StepExecution,
   UserAction,
   VariableVersion,
@@ -41,6 +42,16 @@ export type BundleMedia = {
   data: string
 }
 
+/** Адрес уже открытого чата Qwen. Без него другой компьютер создаёт чат заново. */
+export type BundleChat = {
+  runId: string
+  chatKey: string
+  branchId: string
+  url: string
+  status: RunChatStatus
+  error: string
+}
+
 export type Bundle = {
   format: typeof BUNDLE_FORMAT
   version: typeof BUNDLE_VERSION
@@ -50,6 +61,7 @@ export type Bundle = {
   versions: WorkflowVersion[]
   drafts: BundleDraft[]
   runs: Run[]
+  chats: BundleChat[]
   branches: Branch[]
   executions: StepExecution[]
   artifacts: Artifact[]
@@ -76,8 +88,32 @@ export function parseBundle(text: string): Bundle {
   }
   if (!data.secrets || typeof data.secrets !== 'object' || Array.isArray(data.secrets)) data.secrets = {}
   if (!Array.isArray(data.media)) data.media = []
+  data.chats = normalizeChats(data.chats)
   data.variables = data.variables.map((item) => normalizeImportedVariable(item))
   return data
+}
+
+const CHAT_STATUSES = new Set<RunChatStatus>(['pending', 'running', 'completed', 'failed'])
+
+function normalizeChats(raw: unknown): BundleChat[] {
+  if (!Array.isArray(raw)) return []
+  const chats: BundleChat[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const row = item as Record<string, unknown>
+    const url = typeof row.url === 'string' ? row.url.trim() : ''
+    if (typeof row.runId !== 'string' || typeof row.chatKey !== 'string' || !url) continue
+    const status = CHAT_STATUSES.has(row.status as RunChatStatus) ? (row.status as RunChatStatus) : 'completed'
+    chats.push({
+      runId: row.runId,
+      chatKey: row.chatKey,
+      branchId: typeof row.branchId === 'string' ? row.branchId : '',
+      url,
+      status: status === 'running' ? 'completed' : status,
+      error: typeof row.error === 'string' ? row.error : ''
+    })
+  }
+  return chats
 }
 
 export function normalizeImportedVariable(raw: unknown): NamedVariable {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { attachPaths, detachPaths, normalizeImportedVariable, parseBundle } from '@core/bundle'
+import { attachPaths, BUNDLE_FORMAT, BUNDLE_VERSION, detachPaths, normalizeImportedVariable, parseBundle, type Bundle } from '@core/bundle'
 
 function expect(actual: unknown) {
   return {
@@ -52,4 +52,67 @@ describe('bundle', () => {
     assert.throws(() => parseBundle('{"hello":1}'), /Это не файл экспорта Pipeline/)
     assert.throws(() => parseBundle('not json'), /Файл не является JSON/)
   })
+
+  it('keeps an old export without chat addresses', () => {
+    const bundle = parseBundle(JSON.stringify(shell()))
+    expect(bundle.chats).toEqual([])
+  })
+
+  it('keeps a qwen chat address and drops an empty one', () => {
+    const bundle = parseBundle(
+      JSON.stringify({
+        ...shell(),
+        chats: [
+          { runId: 'run', chatKey: 'analyst', branchId: '', url: 'https://chat.qwen.ai/c/180b240c-1315-49ef-beb3-9604aedfa1f2', status: 'running', error: '' },
+          { runId: 'run', chatKey: 'empty', url: '  ' }
+        ]
+      })
+    )
+    expect(bundle.chats).toEqual([
+      {
+        runId: 'run',
+        chatKey: 'analyst',
+        branchId: '',
+        url: 'https://chat.qwen.ai/c/180b240c-1315-49ef-beb3-9604aedfa1f2',
+        status: 'completed',
+        error: ''
+      }
+    ])
+  })
 })
+
+function shell(): Bundle {
+  const at = '2026-10-17T10:00:00.000Z'
+  return {
+    format: BUNDLE_FORMAT,
+    version: BUNDLE_VERSION,
+    exportedAt: at,
+    projects: [{ id: 'project', name: 'Проект', description: '', settings: {}, createdAt: at, updatedAt: at }],
+    workflows: [{ id: 'workflow', projectId: 'project', name: 'Схема', description: '', createdAt: at, updatedAt: at, latestVersion: 1 }],
+    versions: [{ id: 'version', workflowId: 'workflow', version: 1, graph: { inputs: [], steps: [] }, createdAt: at }],
+    drafts: [],
+    runs: [
+      {
+        id: 'run',
+        projectId: 'project',
+        workflowId: 'workflow',
+        workflowVersionId: 'version',
+        number: 16,
+        title: 'Run #016',
+        status: 'paused',
+        inputs: {},
+        error: null,
+        createdAt: at,
+        updatedAt: at
+      }
+    ],
+    chats: [],
+    branches: [],
+    executions: [],
+    artifacts: [],
+    actions: [],
+    variables: [],
+    secrets: {},
+    media: []
+  }
+}

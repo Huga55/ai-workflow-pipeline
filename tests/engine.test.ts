@@ -2092,6 +2092,158 @@ describe('playwright chats', () => {
     ).toBe('completed')
     expect(sent).toEqual(['concept_maker:', 'concept_maker:'])
   })
+
+  it('does not open a chat when only a transform step is rerun', async () => {
+    const store = new MemoryStore()
+    const opened: string[] = []
+    const sent: string[] = []
+    const runners = createRunners({
+      generate: async (request) => {
+        sent.push(request.chat ?? '')
+        return { raw: 'ok', providerResponse: null, model: 'qwen', provider: 'qwen' }
+      }
+    })
+    const engine = new WorkflowEngine(store, runners)
+    const steps = [
+      step({ id: 'prep', key: 'prep', type: 'transform', order: 1, config: { mode: 'template', template: 'data' } }),
+      step({
+        id: 'ask',
+        key: 'ask',
+        type: 'ai',
+        order: 2,
+        dependsOn: ['prep'],
+        config: {
+          provider: 'qwen',
+          model: 'qwen',
+          chat: 'analyst',
+          messages: [{ id: 'm1', role: 'user', content: 'вопрос' }],
+          outputFormat: 'text'
+        }
+      })
+    ]
+    const workflow = {
+      runtime: 'playwright' as const,
+      inputs: [],
+      chats: [{ key: 'analyst', instruction: 'Ты аналитик.', scope: 'run' as const }],
+      steps
+    }
+    const openChats = async (request: { scope: string }) => {
+      opened.push(request.scope)
+    }
+    expect(await engine.advance({ runId: 'run', graph: workflow, inputs: {}, openChats })).toBe('completed')
+    expect(
+      await engine.advance({
+        runId: 'run',
+        graph: workflow,
+        inputs: {},
+        openChats,
+        focus: { stepId: 'prep', branchId: '', mode: 'only' }
+      })
+    ).toBe('completed')
+    expect(opened).toEqual(['run'])
+    expect(sent).toEqual(['analyst'])
+    expect(store.executions.filter((item) => item.stepId === 'prep')).toHaveLength(2)
+  })
+
+  it('opens the run chat again when only an ai step is rerun', async () => {
+    const store = new MemoryStore()
+    const opened: string[] = []
+    const runners = createRunners({
+      generate: async () => ({ raw: 'ok', providerResponse: null, model: 'qwen', provider: 'qwen' })
+    })
+    const engine = new WorkflowEngine(store, runners)
+    const steps = [
+      step({ id: 'prep', key: 'prep', type: 'transform', order: 1, config: { mode: 'template', template: 'data' } }),
+      step({
+        id: 'ask',
+        key: 'ask',
+        type: 'ai',
+        order: 2,
+        dependsOn: ['prep'],
+        config: {
+          provider: 'qwen',
+          model: 'qwen',
+          chat: 'analyst',
+          messages: [{ id: 'm1', role: 'user', content: 'вопрос' }],
+          outputFormat: 'text'
+        }
+      })
+    ]
+    const workflow = {
+      runtime: 'playwright' as const,
+      inputs: [],
+      chats: [{ key: 'analyst', instruction: 'Ты аналитик.', scope: 'run' as const }],
+      steps
+    }
+    const openChats = async (request: { scope: string }) => {
+      opened.push(request.scope)
+    }
+    expect(await engine.advance({ runId: 'run', graph: workflow, inputs: {}, openChats })).toBe('completed')
+    expect(
+      await engine.advance({
+        runId: 'run',
+        graph: workflow,
+        inputs: {},
+        openChats,
+        focus: { stepId: 'ask', branchId: '', mode: 'only' }
+      })
+    ).toBe('completed')
+    expect(opened).toEqual(['run', 'run'])
+  })
+
+  it('does not open a branch chat when only a transform inside the branch is rerun', async () => {
+    const store = new MemoryStore()
+    const opened: string[] = []
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return ["A"];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'item', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'shape',
+        key: 'shape',
+        type: 'transform',
+        order: 3,
+        dependsOn: ['items'],
+        config: { mode: 'template', template: '{{item}}' }
+      })
+    ]
+    const workflow = {
+      runtime: 'playwright' as const,
+      inputs: [],
+      chats: [{ key: 'shots', instruction: 'Кадры', scope: 'branch' as const }],
+      steps
+    }
+    const openChats = async (request: { scope: string }) => {
+      opened.push(request.scope)
+    }
+    expect(await engine.advance({ runId: 'run', graph: workflow, inputs: {}, openChats })).toBe('completed')
+    const branch = store.branches.find((item) => item.sourceStepId === 'items')
+    expect(
+      await engine.advance({
+        runId: 'run',
+        graph: workflow,
+        inputs: {},
+        openChats,
+        focus: { stepId: 'shape', branchId: branch?.id ?? '', mode: 'only' }
+      })
+    ).toBe('completed')
+    expect(opened).toEqual(['run', 'branch'])
+    expect(store.executions.filter((item) => item.stepId === 'shape')).toHaveLength(2)
+  })
 })
 
 describe('ai step', () => {

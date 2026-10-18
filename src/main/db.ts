@@ -1,7 +1,7 @@
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
 import { DatabaseSync, type SQLOutputValue, type StatementSync } from 'node:sqlite'
-import type { Bundle, BundleDraft, BundleProject } from '@core/bundle'
+import type { Bundle, BundleChat, BundleDraft, BundleProject } from '@core/bundle'
 import type { EngineStore } from '@core/store'
 import type {
   Artifact,
@@ -841,7 +841,11 @@ export class AppDatabase {
       createdAt: row.createdAt
     }))
     const variables = groupVariables(this.all<JoinedVariableRow>(`${VARIABLE_SELECT} ORDER BY nv.name, nvv.version`))
-    return { projects, workflows, versions, drafts, runs, branches, executions, artifacts, actions, variables }
+    const chats = this.all<BundleChat>(
+      `SELECT run_id AS runId, chat_key AS chatKey, branch_id AS branchId, url, status, error
+       FROM run_chats WHERE trim(url) <> ''`
+    )
+    return { projects, workflows, versions, drafts, runs, chats, branches, executions, artifacts, actions, variables }
   }
 
   writeBundle(bundle: Bundle): void {
@@ -942,6 +946,24 @@ export class AppDatabase {
           run.error,
           run.createdAt,
           run.updatedAt
+        )
+      }
+      const runIds = new Set(bundle.runs.map((run) => run.id))
+      for (const chat of bundle.chats ?? []) {
+        if (!chat.url.trim() || !runIds.has(chat.runId)) continue
+        this.run(
+          `INSERT INTO run_chats (run_id, chat_key, branch_id, url, status, error)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(run_id, chat_key, branch_id) DO UPDATE SET
+             url = excluded.url,
+             status = excluded.status,
+             error = excluded.error`,
+          chat.runId,
+          chat.chatKey,
+          chat.branchId,
+          chat.url,
+          chat.status === 'running' ? 'completed' : chat.status,
+          chat.error
         )
       }
       for (const branch of bundle.branches) {

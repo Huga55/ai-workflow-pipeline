@@ -74,9 +74,11 @@ export class WorkflowEngine {
   async advance(options: AdvanceOptions): Promise<AdvanceResult> {
     this.sweepInterrupted(options.runId)
     this.retireMisplacedSideWaits(options)
-    await this.prepareChats(this.rootScope(options.runId), options, 'run')
-    if (options.retry) return this.runSingle(options, options.retry.stepId, options.retry.branchId)
-    if (options.focus?.mode === 'only') return this.runSingle(options, options.focus.stepId, options.focus.branchId)
+    const single = options.retry ?? (options.focus?.mode === 'only' ? options.focus : null)
+    if (!single || this.stepUsesChatScope(single.stepId, options.graph, 'run')) {
+      await this.prepareChats(this.rootScope(options.runId), options, 'run')
+    }
+    if (single) return this.runSingle(options, single.stepId, single.branchId)
     if (options.focus?.mode === 'chain') {
       const allow = chainStepIds(options.focus.stepId, options.graph.steps)
       return this.advanceScope(this.rootScope(options.runId), options.graph.steps, {
@@ -284,7 +286,9 @@ export class WorkflowEngine {
       forceStepIds: new Set([stepId])
     }
     const scope = this.scopeForBranch(options.runId, branchId, null)
-    if (scope.branchId) await this.prepareChats(scope, options, 'branch')
+    if (scope.branchId && this.stepUsesChatScope(stepId, options.graph, 'branch')) {
+      await this.prepareChats(scope, options, 'branch')
+    }
     if (step.iterate && step.id !== scope.entryStepId) {
       return this.runFanout(step, options.graph.steps, scope, limited, true)
     }
@@ -627,6 +631,21 @@ export class WorkflowEngine {
       if (execution?.status !== 'completed') return null
       return this.outputOf(runId, execution.id)
     })
+  }
+
+  private stepUsesChatScope(stepId: string, graph: WorkflowGraph, scope: 'run' | 'branch'): boolean {
+    if ((graph.runtime ?? 'api') !== 'playwright') return false
+    const step = graph.steps.find((item) => item.id === stepId)
+    if (!step) return false
+    const uses = (item: StepDefinition) => {
+      const resolved = effectiveStep(item, graph.steps)
+      if (resolved.type !== 'ai' || !resolved.config.chat) return false
+      const chat = graph.chats?.find((entry) => entry.key === resolved.config.chat)
+      return (chat?.scope === 'branch' ? 'branch' : 'run') === scope
+    }
+    if (uses(step)) return true
+    if (!step.iterate) return false
+    return fanoutInnerSteps(step.id, graph.steps).some((inner) => uses(inner))
   }
 
   private async prepareChats(scope: Scope, options: AdvanceOptions, kind: 'run' | 'branch'): Promise<void> {

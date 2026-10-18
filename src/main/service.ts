@@ -79,6 +79,7 @@ export class AppService {
       versions: snapshot.versions.map((version) => ({ ...version, graph: detach(version.graph) })),
       drafts: snapshot.drafts.map((draft) => ({ ...draft, graph: detach(draft.graph) })),
       runs: snapshot.runs.map((run) => ({ ...run, inputs: detach(run.inputs) })),
+      chats: snapshot.chats,
       branches: snapshot.branches.map((branch) => ({ ...branch, item: detach(branch.item) })),
       executions: snapshot.executions.map((execution) => ({
         ...execution,
