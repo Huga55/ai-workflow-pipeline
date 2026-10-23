@@ -263,7 +263,8 @@ describe('workflow json', () => {
     const copy = parsed.document.graph.steps.find((item) => item.key === 'copy')
     assert.equal(copy?.use, 'base')
     assert.equal(copy?.type, 'ai')
-    if (copy?.type === 'ai') assert.equal(copy.config.messages[0]?.content, '{{snippets.notes_block}}')
+    const copied = copy?.type === 'ai' ? copy.config.messages[0] : undefined
+    assert.equal(copied && 'content' in copied ? copied.content : '', '{{snippets.notes_block}}')
     const items = parsed.document.graph.steps.find((item) => item.key === 'items')
     assert.equal(items?.iterate?.appendOnRerun, true)
   })
@@ -340,7 +341,8 @@ describe('workflow json', () => {
     const step = parsed.document.graph.steps[0]
     assert.equal(step?.type, 'ai')
     if (step?.type !== 'ai') return
-    assert.deepEqual(step.config.messages[1]?.when, { op: 'or', paths: ['inputs.ref'] })
+    const conditioned = step.config.messages[1]
+    assert.deepEqual(conditioned && 'when' in conditioned ? conditioned.when : undefined, { op: 'or', paths: ['inputs.ref'] })
     const again = parseWorkflowJson(formatWorkflowJson(parsed.document), { createId: sequence() })
     assert.equal(again.ok, true, again.ok ? '' : again.errors.join('\n'))
 
@@ -360,5 +362,96 @@ describe('workflow json', () => {
     }`)
     assert.equal(broken.ok, false)
     if (!broken.ok) assert.match(broken.errors.join('\n'), /bad-name/)
+  })
+
+  it('читает общее сообщение и ссылку в шаге', () => {
+    const parsed = parseWorkflowJson(
+      `{
+      "name": "Общие",
+      "inputs": [{ "name": "clothes", "type": "image" }],
+      "sharedMessages": [{
+        "key": "clothes",
+        "name": "Референсы одежды",
+        "role": "user",
+        "content": "Одежда:\\n{{inputs.clothes}}",
+        "when": { "op": "and", "paths": ["inputs.clothes"] }
+      }],
+      "steps": [
+        {
+          "key": "look",
+          "name": "Разбор",
+          "type": "ai",
+          "config": {
+            "provider": "openai",
+            "model": "gpt-4.1-mini",
+            "outputFormat": "text",
+            "messages": [
+              { "role": "user", "content": "Разбери продукт." },
+              { "shared": "clothes" }
+            ]
+          }
+        },
+        {
+          "key": "shots",
+          "name": "Кадры",
+          "type": "ai",
+          "dependsOn": ["look"],
+          "config": {
+            "provider": "openai",
+            "model": "gpt-4.1-mini",
+            "outputFormat": "text",
+            "messages": [{ "shared": "clothes" }]
+          }
+        }
+      ]
+    }`,
+      { createId: sequence() }
+    )
+    assert.equal(parsed.ok, true, parsed.ok ? '' : parsed.errors.join('\n'))
+    if (!parsed.ok) return
+    const shared = parsed.document.graph.sharedMessages?.[0]
+    assert.equal(shared?.key, 'clothes')
+    assert.equal(shared?.when?.paths[0], 'inputs.clothes')
+    const look = parsed.document.graph.steps[0]
+    assert.equal(look?.type, 'ai')
+    if (look?.type !== 'ai') return
+    assert.equal(look.config.messages[1] && 'shared' in look.config.messages[1] ? look.config.messages[1].shared : '', 'clothes')
+    const again = parseWorkflowJson(formatWorkflowJson(parsed.document), { createId: sequence(), previous: parsed.document.graph })
+    assert.equal(again.ok, true, again.ok ? '' : again.errors.join('\n'))
+    if (!again.ok) return
+    assert.equal(again.document.graph.sharedMessages?.[0]?.id, shared?.id)
+
+    const mixed = parseWorkflowJson(`{
+      "name": "Смешение",
+      "inputs": [],
+      "sharedMessages": [{ "key": "clothes", "role": "user", "content": "Одежда" }],
+      "steps": [{
+        "key": "look",
+        "name": "Разбор",
+        "type": "ai",
+        "config": {
+          "model": "gpt-4.1-mini",
+          "messages": [{ "shared": "clothes", "role": "user", "content": "другое" }]
+        }
+      }]
+    }`)
+    assert.equal(mixed.ok, false)
+    if (!mixed.ok) assert.match(mixed.errors.join('\n'), /неизвестное поле «role»/)
+
+    const missing = parseWorkflowJson(`{
+      "name": "Нет общего",
+      "inputs": [],
+      "steps": [{
+        "key": "look",
+        "name": "Разбор",
+        "type": "ai",
+        "config": {
+          "model": "gpt-4.1-mini",
+          "messages": [{ "shared": "clothes" }]
+        }
+      }]
+    }`)
+    assert.equal(missing.ok, false)
+    if (!missing.ok) assert.match(missing.errors.join('\n'), /clothes/)
   })
 })

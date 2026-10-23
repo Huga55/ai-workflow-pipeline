@@ -1974,12 +1974,12 @@ describe('playwright chats', () => {
       })
     expect(await advance('run-a')).toBe('completed')
     expect(await advance('run-b')).toBe('completed')
-    expect(opened).toEqual(['run-a:run:', 'run-b:run:'])
+    expect(opened).toEqual(['run-a:run:', 'run-a:run:', 'run-b:run:', 'run-b:run:'])
     expect(sent).toEqual(['run-a:analyst:первый вопрос', 'run-a:analyst:второй вопрос', 'run-b:analyst:первый вопрос', 'run-b:analyst:второй вопрос'])
     assert.equal(sent.join('\n').includes('Ты аналитик'), false)
   })
 
-  it('opens a separate chat when a branch starts', async () => {
+  it('opens a branch chat when the step that uses it runs', async () => {
     const store = new MemoryStore()
     const opened: string[] = []
     const runners = createRunners({
@@ -2023,16 +2023,105 @@ describe('playwright chats', () => {
       graph: {
         runtime: 'playwright',
         inputs: [],
-        chats: [{ key: 'shots', instruction: 'Кадры', scope: 'branch' }],
+        chats: [
+          { key: 'shots', instruction: 'Кадры', scope: 'branch' },
+          { key: 'spare', instruction: 'Никто не просит', scope: 'branch' }
+        ],
         steps
       },
       inputs: {},
       startManualBranches: true,
       openChats: async (request) => {
-        opened.push(request.scope)
+        opened.push(`${request.chatKey}:${request.scope}`)
       }
     })
-    assert.deepEqual(opened, ['run', 'branch', 'branch'])
+    assert.deepEqual(opened, ['shots:branch', 'shots:branch'])
+  })
+
+  it('does not open a chat for a branch whose steps do not use it', async () => {
+    const store = new MemoryStore()
+    const opened: string[] = []
+    const runners = createRunners({
+      generate: async () => ({ raw: '{"looks":["one"]}', providerResponse: null, model: 'qwen', provider: 'qwen' })
+    })
+    const engine = new WorkflowEngine(store, runners)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return ["A"];' }
+      }),
+      step({
+        id: 'concept-item',
+        key: 'concept_item',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'concept', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'looks',
+        key: 'looks',
+        type: 'ai',
+        order: 3,
+        dependsOn: ['concept-item'],
+        config: {
+          provider: 'qwen',
+          model: 'qwen',
+          chat: 'maker',
+          messages: [{ id: 'm', role: 'user', content: '{{concept}}' }],
+          outputFormat: 'text'
+        }
+      }),
+      step({
+        id: 'parsed',
+        key: 'parsed',
+        type: 'transform',
+        order: 4,
+        dependsOn: ['looks'],
+        config: { mode: 'script', script: 'return ["one", "two"];' }
+      }),
+      step({
+        id: 'look-item',
+        key: 'look_item',
+        type: 'fanout',
+        order: 5,
+        dependsOn: ['parsed'],
+        iterate: { over: '{{steps.parsed.output}}', alias: 'look', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'prompt',
+        key: 'prompt',
+        type: 'transform',
+        order: 6,
+        dependsOn: ['look-item'],
+        config: { mode: 'template', template: '{{look}}' }
+      })
+    ]
+    expect(
+      await engine.advance({
+        runId: 'run',
+        graph: {
+          runtime: 'playwright',
+          inputs: [],
+          chats: [
+            { key: 'maker', instruction: 'Стилист', scope: 'run' },
+            { key: 'look_creator', instruction: 'Ты — Fashion Stylist', scope: 'branch' },
+            { key: 'later', instruction: 'Дополнительные кадры', scope: 'run' }
+          ],
+          steps
+        },
+        inputs: {},
+        openChats: async (request) => {
+          opened.push(`${request.chatKey}:${request.scope}:${request.branchId}`)
+        }
+      })
+    ).toBe('completed')
+    assert.deepEqual(opened, ['maker:run:'])
   })
 
   it('writes a run chat from inside a branch to the shared chat', async () => {
@@ -2241,14 +2330,79 @@ describe('playwright chats', () => {
         focus: { stepId: 'shape', branchId: branch?.id ?? '', mode: 'only' }
       })
     ).toBe('completed')
-    expect(opened).toEqual(['run', 'branch'])
+    expect(opened).toEqual([])
     expect(store.executions.filter((item) => item.stepId === 'shape')).toHaveLength(2)
+  })
+
+  it('resumes one playwright step from a message and sends the following step whole', async () => {
+    const sent: string[] = []
+    const runners = createRunners({
+      generate: async (request) => {
+        const text = request.messages
+          .flatMap((message) => message.content)
+          .filter((part) => part.type === 'text')
+          .map((part) => part.text)
+          .join('\n')
+        sent.push(text)
+        return { raw: 'ok', providerResponse: null, model: 'qwen', provider: 'qwen' }
+      }
+    })
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store, runners)
+    const steps = [
+      step({
+        id: 'first',
+        key: 'first',
+        type: 'ai',
+        order: 1,
+        config: {
+          provider: 'qwen',
+          model: 'qwen',
+          chat: 'analyst',
+          outputFormat: 'text',
+          messages: [
+            { id: 'a', role: 'user', content: 'раз' },
+            { id: 'b', role: 'user', content: 'два' }
+          ]
+        }
+      }),
+      step({
+        id: 'second',
+        key: 'second',
+        type: 'ai',
+        order: 2,
+        dependsOn: ['first'],
+        config: {
+          provider: 'qwen',
+          model: 'qwen',
+          chat: 'analyst',
+          outputFormat: 'text',
+          messages: [{ id: 'c', role: 'user', content: 'три' }]
+        }
+      })
+    ]
+    expect(
+      await engine.advance({
+        runId: 'run',
+        graph: {
+          runtime: 'playwright',
+          inputs: [],
+          chats: [{ key: 'analyst', instruction: 'инструкция', scope: 'run' }],
+          steps
+        },
+        inputs: {},
+        focus: { stepId: 'first', branchId: '', mode: 'chain', fromMessageId: 'b' }
+      })
+    ).toBe('completed')
+    expect(sent).toEqual(['два', 'три'])
+    const first = store.executions.find((item) => item.stepId === 'first')
+    expect(first?.meta.messages?.map((item) => item.status)).toEqual(['completed', 'completed'])
   })
 })
 
 describe('ai step', () => {
   it('sends playwright messages one after another and keeps the last reply', async () => {
-    let seen: string[] = []
+    const seen: string[] = []
     const outcome = await runAiStep(
       {
         provider: 'qwen',
@@ -2263,7 +2417,7 @@ describe('ai step', () => {
       },
       { inputs: {}, steps: {}, aliases: {} },
       async (request) => {
-        seen = request.messages.map((message) => message.content.map((part) => (part.type === 'text' ? part.text : '')).join(''))
+        seen.push(request.messages.map((message) => message.content.map((part) => (part.type === 'text' ? part.text : '')).join('')).join('\n'))
         return { raw: '{"title":"тихий свет"}', providerResponse: null, model: 'qwen', provider: 'qwen' }
       },
       undefined,
@@ -2276,10 +2430,11 @@ describe('ai step', () => {
     assert.equal(seen[0]?.includes('Return only valid JSON'), false)
     expect(outcome.status).toBe('completed')
     expect(outcome.output).toEqual({ title: 'тихий свет' })
+    expect(outcome.meta?.messages?.map((item) => item.status)).toEqual(['completed', 'completed'])
   })
 
   it('skips a whole message when a referenced value is missing', async () => {
-    let seen: string[] = []
+    const seen: string[] = []
     const outcome = await runAiStep(
       {
         provider: 'qwen',
@@ -2294,7 +2449,7 @@ describe('ai step', () => {
       },
       { inputs: { alt: 'свет', pose: 'профиль' }, steps: {}, aliases: {} },
       async (request) => {
-        seen = request.messages.map((message) => message.content.map((part) => (part.type === 'text' ? part.text : '')).join(''))
+        seen.push(request.messages.map((message) => message.content.map((part) => (part.type === 'text' ? part.text : '')).join('')).join('\n'))
         return { raw: 'ok', providerResponse: null, model: 'qwen', provider: 'qwen' }
       },
       undefined,
@@ -2303,6 +2458,68 @@ describe('ai step', () => {
     assert.deepEqual(seen, ['Это оригинал.', 'Запасной свет'])
     expect(outcome.status).toBe('completed')
     expect(outcome.output).toBe('ok')
+    expect(outcome.meta?.messages?.map((item) => item.status)).toEqual(['completed', 'skipped', 'completed'])
+  })
+
+  it('stops on the playwright message that failed and does not send the rest', async () => {
+    let calls = 0
+    const outcome = await runAiStep(
+      {
+        provider: 'qwen',
+        model: 'qwen',
+        chat: 'analyst',
+        outputFormat: 'text',
+        messages: [
+          { id: '1', role: 'user', content: 'раз' },
+          { id: '2', role: 'user', content: 'два' },
+          { id: '3', role: 'user', content: 'три' }
+        ]
+      },
+      { inputs: {}, steps: {}, aliases: {} },
+      async () => {
+        calls += 1
+        if (calls === 2) throw new Error('чат не ответил')
+        return { raw: 'ок', providerResponse: null, model: 'qwen', provider: 'qwen' }
+      },
+      undefined,
+      { runtime: 'playwright', runId: 'run', branchId: '' }
+    )
+    assert.equal(calls, 2)
+    expect(outcome.status).toBe('failed')
+    expect(outcome.error ?? '').toContain('чат не ответил')
+    expect(outcome.meta?.messages?.map((item) => item.status)).toEqual(['completed', 'failed', 'pending'])
+  })
+
+  it('does not resend playwright messages before the chosen one', async () => {
+    const seen: string[] = []
+    const outcome = await runAiStep(
+      {
+        provider: 'qwen',
+        model: 'qwen',
+        chat: 'analyst',
+        outputFormat: 'json',
+        messages: [
+          { id: '1', role: 'user', content: 'раз' },
+          { id: '2', role: 'user', content: 'два' },
+          { id: '3', role: 'user', content: 'три' }
+        ]
+      },
+      { inputs: {}, steps: {}, aliases: {} },
+      async (request) => {
+        seen.push(request.messages.map((message) => message.content.map((part) => (part.type === 'text' ? part.text : '')).join('')).join('\n'))
+        return { raw: '{"ok":true}', providerResponse: null, model: 'qwen', provider: 'qwen' }
+      },
+      undefined,
+      { runtime: 'playwright', runId: 'run', branchId: '', fromMessageId: '2' }
+    )
+    assert.equal(seen[0], 'два')
+    assert.equal(seen[1]?.includes('три'), true)
+    assert.equal(seen[1]?.includes('Return only valid JSON'), true)
+    assert.equal(seen[0]?.includes('Return only valid JSON'), false)
+    assert.equal(seen.some((item) => item.includes('раз')), false)
+    expect(outcome.status).toBe('completed')
+    expect(outcome.output).toEqual({ ok: true })
+    expect(outcome.meta?.messages?.map((item) => item.status)).toEqual(['completed', 'completed', 'completed'])
   })
 
   it('fails when every message is skipped by its condition', async () => {

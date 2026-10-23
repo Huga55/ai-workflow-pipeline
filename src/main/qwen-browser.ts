@@ -4,6 +4,8 @@ import { stitchChunks, stripCodeGutter } from '@core/json'
 import type { ContentPart } from '@core/types'
 
 const CHAT_URL = 'https://chat.qwen.ai/'
+/** Столько превью Qwen держит в одном сообщении. Остальные файлы в это поле не попадают. */
+const IMAGES_PER_TURN = 5
 const COMPOSER_SELECTORS = ['#chat-input', 'textarea.message-input-textarea', 'textarea', '[role="textbox"]']
 const SEND_SELECTORS = [
   '#send-message-button',
@@ -75,6 +77,17 @@ export class QwenBrowser {
 
   async close(): Promise<void> {
     await this.dropContext()
+  }
+
+  forgetRun(runId: string): Promise<void> {
+    return this.enqueue(async () => {
+      const prefix = `${runId}\n`
+      for (const [id, page] of this.slots) {
+        if (!id.startsWith(prefix)) continue
+        this.slots.delete(id)
+        if (pageOpen(page)) await page.close().catch(() => undefined)
+      }
+    })
   }
 
   private enqueue<T>(work: () => Promise<T>): Promise<T> {
@@ -349,13 +362,35 @@ function throwIfAborted(signal?: AbortSignal): void {
 async function deliver(page: Page, parts: ContentPart[], signal?: AbortSignal): Promise<string> {
   throwIfAborted(signal)
   await page.bringToFront().catch(() => undefined)
-  const before = await answerCount(page)
   const images = parts.filter((part) => part.type === 'image').map((part) => part.path)
   const text = parts
     .filter((part) => part.type === 'text')
     .map((part) => part.text)
     .join('')
     .trim()
+  const batches = imageBatches(images, IMAGES_PER_TURN)
+  if (batches.length <= 1) return deliverTurn(page, images, text, signal)
+  let answer = ''
+  for (let index = 0; index < batches.length; index += 1) {
+    const last = index === batches.length - 1
+    const note = last
+      ? text
+      : 'Это часть фотографий одного сообщения, следующие придут отдельно. Пока не анализируй и не выполняй задачу. Ответь только «Принято».'
+    answer = await deliverTurn(page, batches[index] ?? [], note, signal)
+  }
+  return answer
+}
+
+function imageBatches(paths: string[], size: number): string[][] {
+  if (!paths.length) return []
+  const batches: string[][] = []
+  for (let index = 0; index < paths.length; index += size) batches.push(paths.slice(index, index + size))
+  return batches
+}
+
+async function deliverTurn(page: Page, images: string[], text: string, signal?: AbortSignal): Promise<string> {
+  throwIfAborted(signal)
+  const before = await answerCount(page)
   await dismissCookies(page)
   await confirmAge(page)
   if (images.length) await attachImages(page, images, signal)
@@ -391,14 +426,16 @@ async function attachImages(page: Page, paths: string[], signal?: AbortSignal): 
   }
   if (!chosen) throw new Error('Не удалось открыть загрузку фото в Qwen.')
   const deadline = Date.now() + 60_000
+  let shown = 0
   while (Date.now() < deadline) {
     throwIfAborted(signal)
     const total = await page.locator('.vision-item-container').count()
     const uploading = await page.locator('.vision-item-container-uploading').count()
-    if (total >= before + paths.length && uploading === 0) return
+    shown = Math.max(0, total - before)
+    if (shown >= paths.length && uploading === 0) return
     await page.waitForTimeout(400)
   }
-  throw new Error('Фото не прикрепились к сообщению. Превью в поле ввода не появилось, отправка остановлена.')
+  throw new Error(`Фото не прикрепились к сообщению: в превью ${shown} из ${paths.length}. Отправка остановлена.`)
 }
 
 async function waitForShell(page: Page): Promise<void> {

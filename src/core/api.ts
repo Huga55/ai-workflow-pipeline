@@ -3,6 +3,7 @@ import type {
   ProviderStatus,
   NamedVariable,
   RunDetails,
+  RunStepOptions,
   RunSummary,
   StoredFile,
   UserActionPayload,
@@ -45,6 +46,7 @@ export type PipelineApi = {
   deleteRun: (runId: string) => Promise<void>
   createRun: (workflowId: string) => Promise<RunDetails>
   duplicateRun: (runId: string) => Promise<RunDetails>
+  resetRun: (runId: string) => Promise<RunDetails>
   getRun: (runId: string) => Promise<RunDetails>
   updateRunInputs: (runId: string, inputs: Record<string, unknown>) => Promise<RunDetails>
   updateRunTitle: (runId: string, title: string) => Promise<RunDetails>
@@ -60,7 +62,7 @@ export type PipelineApi = {
     stepId: string,
     branchId: string,
     mode: 'only' | 'chain',
-    options?: { appendBatch?: boolean }
+    options?: RunStepOptions
   ) => Promise<RunDetails>
   skipStep: (runId: string, stepId: string, branchId: string) => Promise<RunDetails>
   repairStepJson: (runId: string, stepId: string, branchId: string) => Promise<RunDetails>

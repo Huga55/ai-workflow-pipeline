@@ -1,7 +1,7 @@
 import { extractJson, repairJson, validateJsonSchema } from '@core/json'
 import { inferKind } from '@core/labels'
 import { branchLabel } from '@core/labels'
-import { chainStepIds, fanoutInnerSteps, hiddenDescendantIds, isCollectMerge, topoSort } from '@core/graph'
+import { chainStepIds, fanoutInnerSteps, hiddenDescendantIds, isCollectMerge, owningFanoutId, topoSort } from '@core/graph'
 import { sideChains } from '@core/side-branch'
 import { effectiveStep } from '@core/step-ref'
 import { createId, nowIso } from '@core/ids'
@@ -33,7 +33,7 @@ export type AdvanceOptions = {
   onlyBranchId?: string
   startManualBranches?: boolean
   retry?: { stepId: string; branchId: string }
-  focus?: { stepId: string; branchId: string; mode: 'only' | 'chain' }
+  focus?: { stepId: string; branchId: string; mode: 'only' | 'chain'; fromMessageId?: string }
   allowStepIds?: Set<string>
   forceStepIds?: Set<string>
   branchNote?: string
@@ -45,6 +45,7 @@ export type AdvanceOptions = {
 
 export type OpenChatsRequest = {
   runId: string
+  chatKey: string
   scope: 'run' | 'branch'
   branchId: string
   ctx: VariableContext
@@ -75,9 +76,6 @@ export class WorkflowEngine {
     this.sweepInterrupted(options.runId)
     this.retireMisplacedSideWaits(options)
     const single = options.retry ?? (options.focus?.mode === 'only' ? options.focus : null)
-    if (!single || this.stepUsesChatScope(single.stepId, options.graph, 'run')) {
-      await this.prepareChats(this.rootScope(options.runId), options, 'run')
-    }
     if (single) return this.runSingle(options, single.stepId, single.branchId)
     if (options.focus?.mode === 'chain') {
       const allow = chainStepIds(options.focus.stepId, options.graph.steps)
@@ -286,9 +284,6 @@ export class WorkflowEngine {
       forceStepIds: new Set([stepId])
     }
     const scope = this.scopeForBranch(options.runId, branchId, null)
-    if (scope.branchId && this.stepUsesChatScope(stepId, options.graph, 'branch')) {
-      await this.prepareChats(scope, options, 'branch')
-    }
     if (step.iterate && step.id !== scope.entryStepId) {
       return this.runFanout(step, options.graph.steps, scope, limited, true)
     }
@@ -311,7 +306,6 @@ export class WorkflowEngine {
 
   private async advanceScope(scope: Scope, steps: StepDefinition[], options: AdvanceOptions): Promise<AdvanceResult> {
     if (options.signal?.aborted) return 'paused'
-    if (scope.branchId) await this.prepareChats(scope, options, 'branch')
     const hidden = hiddenDescendantIds(steps, scope.entryStepId)
     const local = steps.filter((step) => !hidden.has(step.id))
     const sorted = topoSort(local)
@@ -558,6 +552,12 @@ export class WorkflowEngine {
     const resolved = this.resolveStep(step, options.graph)
     let outcome: StepOutcome
     try {
+      await this.openStepChat(resolved, scope, options)
+      const focus = options.focus
+      const fromMessageId =
+        focus?.fromMessageId && focus.stepId === step.id && (focus.branchId || '') === (scope.branchId || '')
+          ? focus.fromMessageId
+          : undefined
       outcome = await this.runners[resolved.type]({
         step: resolved,
         ctx: this.buildContext(scope, options, step),
@@ -565,6 +565,12 @@ export class WorkflowEngine {
         runId: options.runId,
         branchId: scope.branchId,
         signal: options.signal,
+        fromMessageId,
+        onMessages: (messages) => {
+          execution.meta = { ...execution.meta, messages }
+          this.store.updateExecution(execution)
+          options.onProgress?.()
+        },
         collectOutputs: (fanoutStepId, fromStepId) => this.collectOutputs(options.runId, scope.branchId, fanoutStepId, fromStepId)
       })
     } catch (error) {
@@ -587,7 +593,7 @@ export class WorkflowEngine {
     execution.rawResponse = outcome.rawResponse ?? null
     execution.parsed = outcome.parsed ?? outcome.output ?? null
     execution.error = outcome.error ?? null
-    execution.meta = { ...(outcome.meta ?? {}) }
+    execution.meta = { ...execution.meta, ...(outcome.meta ?? {}) }
     execution.finishedAt = outcome.status === 'waiting_for_user' ? null : finished
     execution.durationMs = Date.parse(finished) - Date.parse(started)
     this.store.updateExecution(execution)
@@ -633,29 +639,18 @@ export class WorkflowEngine {
     })
   }
 
-  private stepUsesChatScope(stepId: string, graph: WorkflowGraph, scope: 'run' | 'branch'): boolean {
-    if ((graph.runtime ?? 'api') !== 'playwright') return false
-    const step = graph.steps.find((item) => item.id === stepId)
-    if (!step) return false
-    const uses = (item: StepDefinition) => {
-      const resolved = effectiveStep(item, graph.steps)
-      if (resolved.type !== 'ai' || !resolved.config.chat) return false
-      const chat = graph.chats?.find((entry) => entry.key === resolved.config.chat)
-      return (chat?.scope === 'branch' ? 'branch' : 'run') === scope
-    }
-    if (uses(step)) return true
-    if (!step.iterate) return false
-    return fanoutInnerSteps(step.id, graph.steps).some((inner) => uses(inner))
-  }
-
-  private async prepareChats(scope: Scope, options: AdvanceOptions, kind: 'run' | 'branch'): Promise<void> {
+  private async openStepChat(step: StepDefinition, scope: Scope, options: AdvanceOptions): Promise<void> {
     if ((options.graph.runtime ?? 'api') !== 'playwright' || !options.openChats) return
-    if (kind === 'branch' && !scope.branchId) return
+    if (step.type !== 'ai' || !step.config.chat) return
+    const chat = options.graph.chats?.find((item) => item.key === step.config.chat)
+    if (!chat) return
+    const kind = chat.scope === 'branch' ? 'branch' : 'run'
     await options.openChats({
       runId: options.runId,
+      chatKey: chat.key,
       scope: kind,
       branchId: kind === 'run' ? '' : scope.branchId,
-      ctx: this.buildContext(scope, options)
+      ctx: this.buildContext(scope, options, step)
     })
   }
 
@@ -933,14 +928,6 @@ export class WorkflowEngine {
     this.store.insertExecution(execution)
     return 'failed'
   }
-}
-
-function owningFanoutId(stepId: string, steps: StepDefinition[]): string | null {
-  const owners = steps.filter((step) => step.iterate && fanoutInnerSteps(step.id, steps).some((inner) => inner.id === stepId))
-  const inner = owners.find(
-    (owner) => !owners.some((other) => other.id !== owner.id && fanoutInnerSteps(other.id, steps).some((item) => item.id === owner.id))
-  )
-  return inner?.id ?? null
 }
 
 function sideIdsInScope(steps: StepDefinition[], local: StepDefinition[]): Set<string> {

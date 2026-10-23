@@ -1,16 +1,46 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { createId } from '@core/ids'
-import { builderFlowLayout, type BuilderSideBranch } from '@core/builder-flow'
+import { builderFlowLayout, placeStepAfterDependency, type BuilderSideBranch } from '@core/builder-flow'
 import { createInput, createLinkedStep, createStep } from '@core/factories'
 import { effectiveStep, validateGraph } from '@core/graph'
 import { INPUT_TYPE_LABEL, STEP_TYPE_HINT, STEP_TYPE_LABEL, slugify, uniqueKey } from '@core/labels'
+import {
+  expandSharedMessage,
+  findDuplicateGroups,
+  isSharedRef,
+  matchingSharedKey,
+  messageSignature,
+  retargetSharedKey,
+  shareMatchingMessages,
+  whenText,
+  type DuplicateMessageGroup
+} from '@core/shared-messages'
+import { findMissingVariables } from '@core/missing-variables'
 import { latestVariableVersion, type VariablePools } from '@core/variables'
-import type { AIMessageDraft, BranchLaunch, InputDefinition, InputType, MessageWhen, StepDefinition, StepType, WorkflowChat, WorkflowDetails, WorkflowGraph, WorkflowSnippet } from '@core/types'
+import type { AIMessageBody, BranchLaunch, InputDefinition, InputType, MessageWhen, SharedMessage, StepDefinition, StepType, WorkflowChat, WorkflowDetails, WorkflowGraph, WorkflowSnippet } from '@core/types'
 import { formatWorkflowJson, parseWorkflowJson, type WorkflowJsonDocument } from '@core/workflow-json'
-import { copyText, errorText, Hint, TemplateField, VariablePicker, VariablePoolsContext } from '../ui'
+import {
+  copyText,
+  errorText,
+  Hint,
+  MissingFocusContext,
+  MissingNote,
+  MissingVariablesContext,
+  TemplateField,
+  useMissing,
+  useMissingSelection,
+  VariablePicker,
+  VariablePoolsContext
+} from '../ui'
 
 const STEP_TYPES: StepType[] = ['ai', 'transform', 'parse', 'fanout', 'manual', 'merge', 'input']
 const INPUT_TYPES = Object.keys(INPUT_TYPE_LABEL) as InputType[]
+
+function sameIds(left: string[], right: string[]) {
+  if (left.length !== right.length) return false
+  const ids = new Set(left)
+  return right.every((id) => ids.has(id))
+}
 
 export function WorkflowPage({
   projectId,
@@ -39,6 +69,7 @@ export function WorkflowPage({
   const [error, setError] = useState<string | null>(null)
   const snapshot = useRef({ name: '', description: '', graph, selectedId, dirty: false })
   const [pools, setPools] = useState<VariablePools>({})
+  const [missingFocus, setMissingFocus] = useState<{ fieldId: string; nonce: number } | null>(null)
   const [view, setView] = useState<'builder' | 'json'>('builder')
   const [jsonText, setJsonText] = useState('')
   const [jsonError, setJsonError] = useState<string | null>(null)
@@ -261,13 +292,18 @@ export function WorkflowPage({
   }
 
   const selected = graph.steps.find((step) => step.id === selectedId) ?? null
+  const missing = useMemo(() => findMissingVariables(graph, pools), [graph, pools])
+  const missingTargets = useMemo(() => new Set(missing.map((item) => item.targetId)), [missing])
   const issues = validateGraph(graph)
+  const duplicates = findDuplicateGroups(graph)
 
   if (!details) return <div className="page">{error ? <div className="error">{error}</div> : 'Загрузка…'}</div>
 
   const flow = builderFlowLayout(graph.steps)
   return (
     <VariablePoolsContext.Provider value={pools}>
+    <MissingVariablesContext.Provider value={missing}>
+    <MissingFocusContext.Provider value={missingFocus}>
     <div className="split">
       <aside className="rail">
         <button className="ghost" type="button" onClick={onBack}>
@@ -275,7 +311,7 @@ export function WorkflowPage({
         </button>
         <p className="section-label">Входы</p>
         {graph.inputs.map((input) => (
-          <button key={input.id} className="step-tab" type="button" onClick={() => setSelectedId(input.id)}>
+          <button key={input.id} className={tabClass(selectedId === input.id, missingTargets.has(input.id))} type="button" onClick={() => setSelectedId(input.id)}>
             <span>{input.label}</span>
             <small>{input.type}</small>
           </button>
@@ -297,7 +333,7 @@ export function WorkflowPage({
         )}
         <p className="section-label">Фрагменты</p>
         {(graph.snippets ?? []).map((snippet) => (
-          <button key={snippet.key} className="step-tab" type="button" onClick={() => setSelectedId(`snippet:${snippet.key}`)}>
+          <button key={snippet.key} className={tabClass(selectedId === `snippet:${snippet.key}`, missingTargets.has(`snippet:${snippet.key}`))} type="button" onClick={() => setSelectedId(`snippet:${snippet.key}`)}>
             <span>{snippet.key}</span>
             <small>{`{{snippets.${snippet.key}}}`}</small>
           </button>
@@ -317,11 +353,36 @@ export function WorkflowPage({
             Добавить фрагмент
           </button>
         )}
+        <p className="section-label">Общие сообщения</p>
+        {(graph.sharedMessages ?? []).map((shared) => (
+          <button key={shared.id} className={tabClass(selectedId === `shared:${shared.key}`, missingTargets.has(`shared:${shared.key}`))} type="button" onClick={() => setSelectedId(`shared:${shared.key}`)}>
+            <span>{shared.name || shared.key}</span>
+            <small>{shared.key}</small>
+          </button>
+        ))}
+        {!structureLocked && (
+          <button
+            className="ghost"
+            type="button"
+            onClick={() => {
+              const taken = new Set((graph.sharedMessages ?? []).map((item) => item.key))
+              const key = uniqueKey('message', taken)
+              const sharedMessages = [
+                ...(graph.sharedMessages ?? []),
+                { id: createId(), key, name: 'Общее сообщение', role: 'user' as const, content: '' }
+              ]
+              edit({ ...graph, sharedMessages })
+              setSelectedId(`shared:${key}`)
+            }}
+          >
+            Добавить общее
+          </button>
+        )}
         {graph.runtime === 'playwright' && (
           <>
             <p className="section-label">Чаты</p>
             {(graph.chats ?? []).map((chat) => (
-              <button key={chat.key} className="step-tab" type="button" onClick={() => setSelectedId(`chat:${chat.key}`)}>
+              <button key={chat.key} className={tabClass(selectedId === `chat:${chat.key}`, missingTargets.has(`chat:${chat.key}`))} type="button" onClick={() => setSelectedId(`chat:${chat.key}`)}>
                 <span>{chat.key}</span>
                 <small>{chat.scope === 'branch' ? 'в каждой ветке' : 'на запуск'}</small>
               </button>
@@ -346,14 +407,14 @@ export function WorkflowPage({
         <p className="section-label">Граф шагов</p>
         <div className="flow">
           {flow.orphans.map((side) => (
-            <SideBranchBox key={side.root.id} side={side} graph={graph} selectedId={selectedId} onSelect={setSelectedId} />
+            <SideBranchBox key={side.root.id} side={side} graph={graph} selectedId={selectedId} missingTargets={missingTargets} onSelect={setSelectedId} />
           ))}
           {flow.blocks.map((block, index) => (
             <div key={block.step.id} className="flow-col">
               {(index > 0 || flow.orphans.length > 0) && <div className="flow-edge" />}
-              <FlowNodeButton step={block.step} graph={graph} selectedId={selectedId} onSelect={setSelectedId} />
+              <FlowNodeButton step={block.step} graph={graph} selectedId={selectedId} warn={missingTargets.has(block.step.id)} onSelect={setSelectedId} />
               {block.sides.map((side) => (
-                <SideBranchBox key={side.root.id} side={side} graph={graph} selectedId={selectedId} onSelect={setSelectedId} />
+                <SideBranchBox key={side.root.id} side={side} graph={graph} selectedId={selectedId} missingTargets={missingTargets} onSelect={setSelectedId} />
               ))}
             </div>
           ))}
@@ -460,7 +521,7 @@ export function WorkflowPage({
         {view === 'json' ? (
           <div>
             <p className="field-note">
-              Объект с полями name, description, inputs и steps. Для чатов Qwen в корне ещё runtime и chats. Его можно целиком собрать в модели и вставить сюда. id лучше не писать: для новых шагов приложение создаст свои, а уже существующие оставит по ключу. dependsOn пишется ключом шага. Если текст изменился, сохранение проверяет синтаксис, форму шагов и граф.
+              Объект с полями name, description, inputs и steps. Повторяющиеся сообщения — sharedMessages, ссылка в шаге — shared. Для чатов Qwen в корне ещё runtime и chats. Его можно целиком собрать в модели и вставить сюда. id лучше не писать: для новых шагов приложение создаст свои, а уже существующие оставит по ключу. dependsOn пишется ключом шага. Если текст изменился, сохранение проверяет синтаксис, форму шагов и граф.
             </p>
             <div className="row" style={{ marginBottom: 8 }}>
               <button
@@ -492,9 +553,64 @@ export function WorkflowPage({
         ) : (
           <>
         {!!issues.length && <div className="banner">{issues.join('\n')}</div>}
+        {missingGroups(missing).map((group) => (
+          <div className="banner" key={group.fieldId}>
+            <p>
+              {group.place}, {group.field}: {group.items.length === 1 ? 'переменная' : 'переменные'}{' '}
+              {group.items.map((item) => `{{${item.path}}}`).join(', ')} {group.items.length === 1 ? 'не найдена' : 'не найдены'}.
+            </p>
+            {group.items.map((item) =>
+              item.hint ? (
+                <p key={item.path} className="meta">
+                  {item.hint}
+                </p>
+              ) : null
+            )}
+            <button
+              className="ghost"
+              type="button"
+              onClick={() => {
+                setSelectedId(group.targetId)
+                setMissingFocus({ fieldId: group.fieldId, nonce: Date.now() })
+              }}
+            >
+              Открыть
+            </button>
+          </div>
+        ))}
+        {!readOnly &&
+          duplicates.map((group) => (
+            <div className="banner" key={group.signature}>
+              <p>
+                Одинаковое сообщение в шагах {group.places.map((place) => `«${place.stepName}»`).join(', ')}: роль, текст и условие совпадают.
+                {' '}
+                {group.preview}
+              </p>
+              <button className="ghost" type="button" onClick={() => edit(shareMatchingMessages(graph, group.signature))}>
+                {group.sharedKey ? 'Заменить общим везде' : 'Сделать общим и заменить везде'}
+              </button>
+            </div>
+          ))}
+        {selectedId?.startsWith('shared:') && (
+          <SharedMessageEditor
+            shared={(graph.sharedMessages ?? []).find((item) => item.key === selectedId.slice('shared:'.length)) ?? null}
+            graph={graph}
+            readOnly={readOnly}
+            onChange={(shared, previousKey) => {
+              const sharedMessages = (graph.sharedMessages ?? []).map((item) => (item.key === previousKey ? shared : item))
+              edit({ ...graph, sharedMessages, steps: retargetSharedKey(graph.steps, previousKey, shared.key) })
+              setSelectedId(`shared:${shared.key}`)
+            }}
+            onDelete={(key) => {
+              edit(expandSharedMessage(graph, key))
+              setSelectedId(null)
+            }}
+          />
+        )}
         {selectedId?.startsWith('snippet:') && (
           <SnippetEditor
             snippet={(graph.snippets ?? []).find((item) => item.key === selectedId.slice('snippet:'.length)) ?? null}
+            graph={graph}
             readOnly={readOnly}
             onChange={(snippet, previousKey) => {
               const snippets = (graph.snippets ?? []).map((item) => (item.key === previousKey ? snippet : item))
@@ -510,6 +626,7 @@ export function WorkflowPage({
         {selectedId?.startsWith('chat:') && graph.runtime === 'playwright' && (
           <ChatEditor
             chat={(graph.chats ?? []).find((item) => item.key === selectedId.slice('chat:'.length)) ?? null}
+            graph={graph}
             readOnly={readOnly}
             onChange={(chat, previousKey) => {
               const chats = (graph.chats ?? []).map((item) => (item.key === previousKey ? chat : item))
@@ -541,7 +658,17 @@ export function WorkflowPage({
             graph={graph}
             step={selected}
             readOnly={readOnly}
-            onChange={(step) => edit({ ...graph, steps: graph.steps.map((item) => (item.id === step.id ? step : item)) })}
+            duplicates={duplicates}
+            onOpenShared={(key) => setSelectedId(`shared:${key}`)}
+            onShare={(signature) => edit(shareMatchingMessages(graph, signature))}
+            onChange={(step) => {
+              const previous = graph.steps.find((item) => item.id === step.id)
+              let steps = graph.steps.map((item) => (item.id === step.id ? step : item))
+              const depsChanged = !previous || !sameIds(previous.dependsOn, step.dependsOn)
+              const sideChanged = Boolean(previous?.sideBranch) !== Boolean(step.sideBranch)
+              if (depsChanged || sideChanged) steps = placeStepAfterDependency(steps, step.id)
+              edit({ ...graph, steps })
+            }}
             onLink={() => {
               const linked = createLinkedStep(selected, graph)
               edit({ ...graph, steps: [...graph.steps, linked] })
@@ -573,6 +700,8 @@ export function WorkflowPage({
         )}
       </section>
     </div>
+    </MissingFocusContext.Provider>
+    </MissingVariablesContext.Provider>
     </VariablePoolsContext.Provider>
   )
 }
@@ -640,16 +769,18 @@ function FlowNodeButton({
   step,
   graph,
   selectedId,
+  warn = false,
   onSelect
 }: {
   step: StepDefinition
   graph: WorkflowGraph
   selectedId: string | null
+  warn?: boolean
   onSelect: (id: string) => void
 }) {
   const resolved = effectiveStep(step, graph.steps)
   return (
-    <button className={`flow-node ${selectedId === step.id ? 'active' : ''}`} type="button" onClick={() => onSelect(step.id)}>
+    <button className={`flow-node${selectedId === step.id ? ' active' : ''}${warn ? ' warn' : ''}`} type="button" onClick={() => onSelect(step.id)}>
       <span>{step.name}</span>
       <small title={STEP_TYPE_HINT[resolved.type]}>
         {STEP_TYPE_LABEL[resolved.type]}
@@ -665,11 +796,13 @@ function SideBranchBox({
   side,
   graph,
   selectedId,
+  missingTargets,
   onSelect
 }: {
   side: BuilderSideBranch
   graph: WorkflowGraph
   selectedId: string | null
+  missingTargets: Set<string>
   onSelect: (id: string) => void
 }) {
   return (
@@ -678,7 +811,7 @@ function SideBranchBox({
       {side.steps.map((step, index) => (
         <div key={step.id} className="flow-col">
           {index > 0 && <div className="flow-edge" />}
-          <FlowNodeButton step={step} graph={graph} selectedId={selectedId} onSelect={onSelect} />
+          <FlowNodeButton step={step} graph={graph} selectedId={selectedId} warn={missingTargets.has(step.id)} onSelect={onSelect} />
         </div>
       ))}
     </div>
@@ -691,13 +824,29 @@ function clearStepChat(step: StepDefinition): StepDefinition {
   return { ...step, config }
 }
 
+function tabClass(active: boolean, warn = false): string {
+  return `step-tab${active ? ' active' : ''}${warn ? ' warn' : ''}`
+}
+
+function missingGroups(issues: ReturnType<typeof findMissingVariables>) {
+  const groups: { fieldId: string; targetId: string; place: string; field: string; items: typeof issues }[] = []
+  for (const issue of issues) {
+    const group = groups.find((item) => item.fieldId === issue.fieldId)
+    if (group) group.items.push(issue)
+    else groups.push({ fieldId: issue.fieldId, targetId: issue.targetId, place: issue.place, field: issue.field, items: [issue] })
+  }
+  return groups
+}
+
 function ChatEditor({
   chat,
+  graph,
   readOnly,
   onChange,
   onDelete
 }: {
   chat: WorkflowChat | null
+  graph: WorkflowGraph
   readOnly: boolean
   onChange: (chat: WorkflowChat, previousKey: string) => void
   onDelete: (key: string) => void
@@ -722,16 +871,16 @@ function ChatEditor({
           <option value="branch">Свой в каждой ветке</option>
         </select>
       </label>
-      <label className="field">
-        <span>Инструкция</span>
-        <textarea
-          rows={10}
-          value={chat.instruction}
-          disabled={readOnly}
-          onChange={(event) => onChange({ ...chat, instruction: event.target.value }, chat.key)}
-        />
-        <p className="field-note">Уходит в новый чат один раз, в начале запуска или ветки. Можно вставить {`{{inputs...}}`} и фото.</p>
-      </label>
+      <TemplateField
+        label="Инструкция"
+        value={chat.instruction}
+        graph={graph}
+        readOnly={readOnly}
+        rows={10}
+        fieldId={`chat:${chat.key}:instruction`}
+        onChange={(instruction) => onChange({ ...chat, instruction }, chat.key)}
+      />
+      <p className="field-note">Уходит один раз, когда AI-шаг впервые использует этот чат. Дальше шаги пишут в уже открытый. Можно вставить переменную и фото.</p>
       {!readOnly && (
         <button className="danger" type="button" onClick={() => onDelete(chat.key)}>
           Удалить чат
@@ -741,13 +890,113 @@ function ChatEditor({
   )
 }
 
+function SharedMessageEditor({
+  shared,
+  graph,
+  readOnly,
+  onChange,
+  onDelete
+}: {
+  shared: SharedMessage | null
+  graph: WorkflowGraph
+  readOnly: boolean
+  onChange: (shared: SharedMessage, previousKey: string) => void
+  onDelete: (key: string) => void
+}) {
+  if (!shared) return <p className="meta">Общее сообщение не найдено</p>
+  const usedBy = graph.steps.filter(
+    (step) => step.type === 'ai' && !step.use && step.config.messages.some((message) => isSharedRef(message) && message.shared === shared.key)
+  )
+  const body: AIMessageBody = { id: shared.id, role: shared.role, content: shared.content, ...(shared.when ? { when: shared.when } : {}) }
+  return (
+    <div>
+      <h2>Общее сообщение</h2>
+      <p className="field-note">Роль, текст и условие одни на весь workflow. В шаге меняется только положение среди других сообщений.</p>
+      <label className="field">
+        <span>Название</span>
+        <input value={shared.name} disabled={readOnly} onChange={(event) => onChange({ ...shared, name: event.target.value }, shared.key)} />
+      </label>
+      <label className="field">
+        <span>Ключ</span>
+        <input value={shared.key} disabled={readOnly} onChange={(event) => onChange({ ...shared, key: event.target.value }, shared.key)} />
+        <p className="field-note">В сообщении шага: {`{ "shared": "${shared.key || 'ключ'}" }`}</p>
+      </label>
+      <label className="field">
+        <span>Роль</span>
+        <select
+          value={shared.role}
+          disabled={readOnly}
+          onChange={(event) => onChange({ ...shared, role: event.target.value as SharedMessage['role'] }, shared.key)}
+        >
+          <option value="system">system</option>
+          <option value="user">user</option>
+          <option value="assistant">assistant</option>
+        </select>
+      </label>
+      <TemplateField
+        label="Текст"
+        value={shared.content}
+        graph={graph}
+        readOnly={readOnly}
+        fieldId={`shared:${shared.key}:content`}
+        onChange={(content) => onChange({ ...shared, content }, shared.key)}
+      />
+      <MessageWhenField
+        message={body}
+        graph={graph}
+        readOnly={readOnly}
+        fieldId={`shared:${shared.key}:when`}
+        onChange={(when) => onChange({ ...shared, when }, shared.key)}
+      />
+      <p className="field-note">
+        {usedBy.length
+          ? `Стоит в шагах ${usedBy.map((step) => `«${step.name}»`).join(', ')}.`
+          : 'Пока ни один шаг его не вставил.'}
+      </p>
+      {!readOnly && (
+        <button className="danger" type="button" onClick={() => onDelete(shared.key)}>
+          Удалить общее
+        </button>
+      )}
+      {!readOnly && usedBy.length > 0 && <p className="field-note">Удаление вернёт текст в каждый шаг, где стояла ссылка.</p>}
+    </div>
+  )
+}
+
+function SharedMessageSlot({
+  sharedKey,
+  shared,
+  onOpen
+}: {
+  sharedKey: string
+  shared: SharedMessage | undefined
+  onOpen: () => void
+}) {
+  if (!shared) return <p className="error">Нет общего сообщения «{sharedKey}»</p>
+  return (
+    <div>
+      <p className="field-note">Текст, роль и условие правятся в общем сообщении. Здесь можно сдвинуть его или убрать из шага.</p>
+      <p>
+        <strong>{shared.name || shared.key}</strong> <span className="meta">{shared.role}</span>
+      </p>
+      <p className="meta">{whenText(shared.when)}</p>
+      <pre className="json">{shared.content || 'Пустой текст'}</pre>
+      <button className="ghost" type="button" onClick={onOpen}>
+        Открыть общее
+      </button>
+    </div>
+  )
+}
+
 function SnippetEditor({
   snippet,
+  graph,
   readOnly,
   onChange,
   onDelete
 }: {
   snippet: WorkflowSnippet | null
+  graph: WorkflowGraph
   readOnly: boolean
   onChange: (snippet: WorkflowSnippet, previousKey: string) => void
   onDelete: (key: string) => void
@@ -765,15 +1014,15 @@ function SnippetEditor({
         />
         <p className="field-note">В промптах: {`{{snippets.${snippet.key || 'ключ'}}}`}</p>
       </label>
-      <label className="field">
-        <span>Текст</span>
-        <textarea
-          rows={10}
-          value={snippet.content}
-          disabled={readOnly}
-          onChange={(event) => onChange({ ...snippet, content: event.target.value }, snippet.key)}
-        />
-      </label>
+      <TemplateField
+        label="Текст"
+        value={snippet.content}
+        graph={graph}
+        readOnly={readOnly}
+        rows={10}
+        fieldId={`snippet:${snippet.key}:content`}
+        onChange={(content) => onChange({ ...snippet, content }, snippet.key)}
+      />
       {!readOnly && (
         <button className="danger" type="button" onClick={() => onDelete(snippet.key)}>
           Удалить фрагмент
@@ -787,6 +1036,9 @@ function StepEditor({
   graph,
   step,
   readOnly,
+  duplicates,
+  onOpenShared,
+  onShare,
   onChange,
   onDelete,
   onLink,
@@ -795,6 +1047,9 @@ function StepEditor({
   graph: WorkflowGraph
   step: StepDefinition
   readOnly: boolean
+  duplicates: DuplicateMessageGroup[]
+  onOpenShared: (key: string) => void
+  onShare: (signature: string) => void
   onChange: (step: StepDefinition) => void
   onDelete: () => void
   onLink: () => void
@@ -911,6 +1166,7 @@ function StepEditor({
               </option>
             ))}
         </select>
+        <p className="field-note">Шаг встанет сразу после этой зависимости. Доп. ветки одного шага идут целиком, одна за другой, а следующий шаг основной ветки — после них.</p>
       </label>
       <label className="check">
         <input type="checkbox" checked={step.stopAfter} disabled={readOnly} onChange={(event) => onChange({ ...step, stopAfter: event.target.checked })} />
@@ -955,7 +1211,7 @@ function StepEditor({
         </label>
         {step.iterate && (
           <>
-            <TemplateField label="Массив" value={step.iterate.over} graph={graph} step={step} readOnly={readOnly} rows={2} onChange={(over) => onChange({ ...step, iterate: { ...step.iterate!, over } })} />
+            <TemplateField label="Массив" value={step.iterate.over} graph={graph} step={step} readOnly={readOnly} rows={2} fieldId={`step:${step.id}:over`} onChange={(over) => onChange({ ...step, iterate: { ...step.iterate!, over } })} />
             <label className="field">
               <span>Имя элемента</span>
               <input
@@ -1029,7 +1285,15 @@ function StepEditor({
           Содержимое шага из <code>{step.use}</code>. Правьте оригинал; здесь меняются только положение и ветвление.
         </p>
       ) : null}
-      <StepConfig graph={graph} step={resolved} readOnly={readOnly || linked} onChange={linked ? () => undefined : onChange} />
+      <StepConfig
+        graph={graph}
+        step={resolved}
+        readOnly={readOnly || linked}
+        duplicates={duplicates}
+        onOpenShared={onOpenShared}
+        onShare={readOnly || linked ? undefined : onShare}
+        onChange={linked ? () => undefined : onChange}
+      />
       {!readOnly && (
         <button className="danger" type="button" onClick={onDelete}>
           Удалить шаг
@@ -1043,13 +1307,22 @@ function StepConfig({
   graph,
   step,
   readOnly,
+  duplicates,
+  onOpenShared,
+  onShare,
   onChange
 }: {
   graph: WorkflowGraph
   step: StepDefinition
   readOnly: boolean
+  duplicates: DuplicateMessageGroup[]
+  onOpenShared: (key: string) => void
+  onShare?: (signature: string) => void
   onChange: (step: StepDefinition) => void
 }) {
+  const promptRef = useRef<HTMLInputElement>(null)
+  const promptMissing = useMissing(step.type === 'manual' ? `step:${step.id}:prompt` : undefined)
+  useMissingSelection(`step:${step.id}:prompt`, step.type === 'manual' ? step.config.prompt : '', promptRef)
   if (step.type === 'ai') {
     const playwright = graph.runtime === 'playwright'
     return (
@@ -1074,7 +1347,7 @@ function StepConfig({
                 </option>
               ))}
             </select>
-            <p className="field-note">Каждое сообщение с ролью user уходит отдельно, сверху вниз, и ждёт ответ. Результат шага — ответ на последнее отправленное. Инструкция чата уже отправлена. system и assistant в чат не пишутся.</p>
+            <p className="field-note">Каждое сообщение с ролью user уходит отдельно, сверху вниз, и ждёт ответ. Результат шага — ответ на последнее отправленное. Если чат ещё не открыт, его инструкция уходит перед этими сообщениями. system и assistant в чат не пишутся.</p>
           </label>
         )}
         {!playwright && (
@@ -1119,81 +1392,137 @@ function StepConfig({
           />
         )}
         <div className="messages">
-          {step.config.messages.map((message, index) => (
-            <div key={message.id} className="message">
-              <div className="row" style={{ justifyContent: 'space-between' }}>
-                <span className="meta">Сообщение {index + 1}</span>
-                {!readOnly && (
-                  <div className="row">
-                    <button className="ghost" type="button" disabled={index === 0} onClick={() => moveMessage(step, index, -1, onChange)}>
-                      Выше
-                    </button>
-                    <button
-                      className="ghost"
-                      type="button"
-                      disabled={index === step.config.messages.length - 1}
-                      onClick={() => moveMessage(step, index, 1, onChange)}
-                    >
-                      Ниже
-                    </button>
-                    <button
-                      className="ghost"
-                      type="button"
-                      onClick={() =>
-                        onChange({
-                          ...step,
-                          config: { ...step.config, messages: step.config.messages.filter((item) => item.id !== message.id) }
-                        })
-                      }
-                    >
-                      Удалить
-                    </button>
-                  </div>
+          {step.config.messages.map((message, index) => {
+            const shared = isSharedRef(message) ? (graph.sharedMessages ?? []).find((item) => item.key === message.shared) : undefined
+            const sameShared = !isSharedRef(message) ? matchingSharedKey(graph, message) : undefined
+            const sameGroup = !isSharedRef(message) ? duplicates.find((item) => item.signature === messageSignature(message)) : undefined
+            const otherSteps = sameGroup?.places.filter((place) => place.stepId !== step.id) ?? []
+            const suggest = !readOnly && !isSharedRef(message) && (sameShared || otherSteps.length > 0)
+            return (
+              <div key={message.id} className={isSharedRef(message) ? 'message message-shared' : suggest ? 'message message-suggest' : 'message'}>
+                <div className="row" style={{ justifyContent: 'space-between' }}>
+                  <span className="meta">{isSharedRef(message) ? `Общее ${index + 1}` : `Сообщение ${index + 1}`}</span>
+                  {!readOnly && (
+                    <div className="row">
+                      <button className="ghost" type="button" disabled={index === 0} onClick={() => moveMessage(step, index, -1, onChange)}>
+                        Выше
+                      </button>
+                      <button
+                        className="ghost"
+                        type="button"
+                        disabled={index === step.config.messages.length - 1}
+                        onClick={() => moveMessage(step, index, 1, onChange)}
+                      >
+                        Ниже
+                      </button>
+                      <button
+                        className="ghost"
+                        type="button"
+                        onClick={() =>
+                          onChange({
+                            ...step,
+                            config: { ...step.config, messages: step.config.messages.filter((item) => item.id !== message.id) }
+                          })
+                        }
+                      >
+                        Удалить
+                      </button>
+                    </div>
+                  )}
+                </div>
+                {isSharedRef(message) ? (
+                  <SharedMessageSlot
+                    sharedKey={message.shared}
+                    shared={shared}
+                    onOpen={() => onOpenShared(message.shared)}
+                  />
+                ) : (
+                  <>
+                    {suggest && onShare && (
+                      <div className="banner">
+                        <p>
+                          {sameShared
+                            ? `Совпадает с общим «${(graph.sharedMessages ?? []).find((item) => item.key === sameShared)?.name || sameShared}».${otherSteps.length ? ` Такое же есть в шагах ${otherSteps.map((place) => `«${place.stepName}»`).join(', ')}.` : ''} Ссылка встанет во все такие сообщения, в шаге останется только положение.`
+                            : `Такое же сообщение есть в шагах ${otherSteps.map((place) => `«${place.stepName}»`).join(', ')}. Его можно сделать общим: роль, текст и условие станут одними, во всех этих шагах останется только положение.`}
+                        </p>
+                        <button className="ghost" type="button" onClick={() => onShare(messageSignature(message))}>
+                          {sameShared ? 'Заменить общим везде' : 'Сделать общим'}
+                        </button>
+                      </div>
+                    )}
+                    <label className="field">
+                      <span>Роль</span>
+                      <select
+                        value={message.role}
+                        disabled={readOnly}
+                        onChange={(event) => updateMessage(step, message.id, { role: event.target.value as AIMessageBody['role'] }, onChange)}
+                      >
+                        <option value="system">system</option>
+                        <option value="user">user</option>
+                        <option value="assistant">assistant</option>
+                      </select>
+                    </label>
+                    <TemplateField
+                      label="Текст"
+                      value={message.content}
+                      graph={graph}
+                      step={step}
+                      readOnly={readOnly}
+                      fieldId={`step:${step.id}:message:${message.id}`}
+                      onChange={(content) => updateMessage(step, message.id, { content }, onChange)}
+                    />
+                    <MessageWhenField
+                      fieldId={`step:${step.id}:message:${message.id}:when`}
+                      message={message}
+                      graph={graph}
+                      step={step}
+                      readOnly={readOnly}
+                      onChange={(when) => updateMessage(step, message.id, { when }, onChange)}
+                    />
+                  </>
                 )}
               </div>
-              <label className="field">
-                <span>Роль</span>
-                <select
-                  value={message.role}
-                  disabled={readOnly}
-                  onChange={(event) => updateMessage(step, message.id, { role: event.target.value as AIMessageDraft['role'] }, onChange)}
-                >
-                  <option value="system">system</option>
-                  <option value="user">user</option>
-                  <option value="assistant">assistant</option>
-                </select>
-              </label>
-              <TemplateField
-                label="Текст"
-                value={message.content}
-                graph={graph}
-                step={step}
-                readOnly={readOnly}
-                onChange={(content) => updateMessage(step, message.id, { content }, onChange)}
-              />
-              <MessageWhenField
-                message={message}
-                graph={graph}
-                step={step}
-                readOnly={readOnly}
-                onChange={(when) => updateMessage(step, message.id, { when }, onChange)}
-              />
-            </div>
-          ))}
+            )
+          })}
         </div>
         {!readOnly && (
-          <button
-            className="ghost"
-            type="button"
-            onClick={() =>
-              onChange({
-                ...step,
-                config: { ...step.config, messages: [...step.config.messages, { id: createId(), role: 'user', content: '' }] }
-              })
-            }
-          >
-            Добавить сообщение
-          </button>
+          <div className="row">
+            <button
+              className="ghost"
+              type="button"
+              onClick={() =>
+                onChange({
+                  ...step,
+                  config: { ...step.config, messages: [...step.config.messages, { id: createId(), role: 'user', content: '' }] }
+                })
+              }
+            >
+              Добавить сообщение
+            </button>
+            {(graph.sharedMessages ?? []).length > 0 && (
+              <label className="field" style={{ margin: 0, minWidth: 220 }}>
+                <span>Вставить общее</span>
+                <select
+                  value=""
+                  onChange={(event) => {
+                    const key = event.target.value
+                    if (!key) return
+                    onChange({
+                      ...step,
+                      config: { ...step.config, messages: [...step.config.messages, { id: createId(), shared: key }] }
+                    })
+                  }}
+                >
+                  <option value="">Вставить общее…</option>
+                  {(graph.sharedMessages ?? []).map((item) => (
+                    <option key={item.key} value={item.key}>
+                      {item.name || item.key}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+          </div>
         )}
       </div>
     )
@@ -1215,14 +1544,15 @@ function StepConfig({
           </select>
         </label>
         {step.config.mode === 'template' && (
-          <TemplateField label="Шаблон" value={step.config.template ?? ''} graph={graph} step={step} readOnly={readOnly} onChange={(template) => onChange({ ...step, config: { ...step.config, template } })} />
+          <TemplateField label="Шаблон" value={step.config.template ?? ''} graph={graph} step={step} readOnly={readOnly} fieldId={`step:${step.id}:template`} onChange={(template) => onChange({ ...step, config: { ...step.config, template } })} />
         )}
         {step.config.mode === 'extract' && (
-          <TemplateField label="Источник" value={step.config.source ?? ''} graph={graph} step={step} readOnly={readOnly} rows={2} onChange={(source) => onChange({ ...step, config: { ...step.config, source } })} />
+          <TemplateField label="Источник" value={step.config.source ?? ''} graph={graph} step={step} readOnly={readOnly} rows={2} fieldId={`step:${step.id}:source`} onChange={(source) => onChange({ ...step, config: { ...step.config, source } })} />
         )}
         {step.config.mode === 'filter' && (
           <>
-            <TemplateField label="Массив" value={step.config.source ?? ''} graph={graph} step={step} readOnly={readOnly} rows={2} onChange={(source) => onChange({ ...step, config: { ...step.config, source } })} />
+            <TemplateField label="Массив" value={step.config.source ?? ''} graph={graph} step={step} readOnly={readOnly} rows={2} fieldId={`step:${step.id}:source`} onChange={(source) => onChange({ ...step, config: { ...step.config, source } })} />
+            <MissingNote fieldId={`step:${step.id}:value`} />
             <label className="field">
               <span>Поле</span>
               <input value={step.config.field ?? ''} disabled={readOnly} onChange={(event) => onChange({ ...step, config: { ...step.config, field: event.target.value } })} />
@@ -1253,6 +1583,7 @@ function StepConfig({
           step={step}
           readOnly={readOnly}
           rows={2}
+          fieldId={`step:${step.id}:over`}
           onChange={(over) => onChange({ ...step, type: 'fanout', iterate: { ...iterate, over }, config: {} })}
         />
         <label className="field">
@@ -1307,7 +1638,7 @@ function StepConfig({
     return (
       <div>
         <p className="field-note">Лучше просить AI шаг вернуть JSON по схеме. Разбор нужен, когда на руках уже есть текст или JSON-строка и из них надо получить массив для ветвления.</p>
-        <TemplateField label="Источник" value={step.config.source} graph={graph} step={step} readOnly={readOnly} rows={2} onChange={(source) => onChange({ ...step, config: { ...step.config, source } })} />
+        <TemplateField label="Источник" value={step.config.source} graph={graph} step={step} readOnly={readOnly} rows={2} fieldId={`step:${step.id}:source`} onChange={(source) => onChange({ ...step, config: { ...step.config, source } })} />
         <label className="field">
           <span>Режим</span>
           <select
@@ -1356,9 +1687,16 @@ function StepConfig({
         </label>
         <label className="field">
           <span>Подсказка</span>
-          <input value={step.config.prompt} disabled={readOnly} onChange={(event) => onChange({ ...step, config: { ...step.config, prompt: event.target.value } })} />
+          <input
+            ref={promptRef}
+            className={promptMissing.length ? 'missing-input' : undefined}
+            value={step.config.prompt}
+            disabled={readOnly}
+            onChange={(event) => onChange({ ...step, config: { ...step.config, prompt: event.target.value } })}
+          />
+          <MissingNote fieldId={`step:${step.id}:prompt`} />
         </label>
-        <TemplateField label="Источник" value={step.config.source ?? ''} graph={graph} step={step} readOnly={readOnly} rows={2} onChange={(source) => onChange({ ...step, config: { ...step.config, source } })} />
+        <TemplateField label="Источник" value={step.config.source ?? ''} graph={graph} step={step} readOnly={readOnly} rows={2} fieldId={`step:${step.id}:source`} onChange={(source) => onChange({ ...step, config: { ...step.config, source } })} />
         <label className="check">
           <input type="checkbox" checked={Boolean(step.config.allowEmpty)} disabled={readOnly} onChange={(event) => onChange({ ...step, config: { ...step.config, allowEmpty: event.target.checked } })} />
           {step.type === 'manual' && step.config.mode === 'text' ? 'Можно оставить пустым' : 'Можно ничего не выбирать'}
@@ -1414,6 +1752,7 @@ function StepConfig({
               step={step}
               readOnly={readOnly}
               rows={2}
+              fieldId={`step:${step.id}:merge:${index}`}
               onChange={(ref) => {
                 const next = sources.map((item, itemIndex) => (itemIndex === index ? { ...item, ref } : item))
                 onChange({ ...step, config: { mode: 'object', sources: next } })
@@ -1464,14 +1803,14 @@ function moveMessage(
 function updateMessage(
   step: Extract<StepDefinition, { type: 'ai' }>,
   id: string,
-  patch: Partial<AIMessageDraft>,
+  patch: Partial<AIMessageBody>,
   onChange: (step: StepDefinition) => void
 ) {
   onChange({
     ...step,
     config: {
       ...step.config,
-      messages: step.config.messages.map((message) => (message.id === id ? { ...message, ...patch } : message))
+      messages: step.config.messages.map((message) => (message.id === id && !isSharedRef(message) ? { ...message, ...patch } : message))
     }
   })
 }
@@ -1481,16 +1820,21 @@ function MessageWhenField({
   graph,
   step,
   readOnly,
+  fieldId,
   onChange
 }: {
-  message: AIMessageDraft
+  message: AIMessageBody
   graph: WorkflowGraph
-  step: StepDefinition
+  step?: StepDefinition
   readOnly: boolean
+  fieldId?: string
   onChange: (when: MessageWhen | undefined) => void
 }) {
   const mode = message.when?.op ?? 'always'
   const paths = message.when?.paths ?? []
+  const missing = useMissing(fieldId)
+  const pathRef = useRef<HTMLInputElement>(null)
+  useMissingSelection(fieldId, missing[0]?.path ?? '', pathRef)
   function setPaths(op: 'and' | 'or', next: string[]) {
     onChange({ op, paths: next })
   }
@@ -1515,17 +1859,22 @@ function MessageWhenField({
       {message.when && (
         <>
           <p className="field-note">Пустая переменная пропускает всё сообщение, а не кусок текста. Несколько путей складываются через «все» или «хотя бы одна».</p>
-          {paths.map((path, index) => (
-            <label className="field" key={`${message.id}-${index}`}>
+          {paths.map((path, index) => {
+            const bad = missing.some((issue) => issue.path === path)
+            return (
+            <label className={bad ? 'field has-missing' : 'field'} key={`${message.id}-${index}`}>
               <span>Переменная {index + 1}</span>
               <input
+                ref={path === missing[0]?.path ? pathRef : undefined}
                 value={path}
                 disabled={readOnly}
                 placeholder="inputs.ref"
                 onChange={(event) => setPaths(message.when!.op, paths.map((item, itemIndex) => (itemIndex === index ? event.target.value.trim() : item)))}
               />
             </label>
-          ))}
+            )
+          })}
+          <MissingNote fieldId={fieldId} />
           {!readOnly && (
             <div className="row">
               <VariablePicker

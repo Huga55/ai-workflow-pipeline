@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { app, BrowserWindow, clipboard, dialog, ipcMain } from 'electron'
 import { pathsFromUriList } from '@core/clipboard-files'
-import type { UserActionPayload, WorkflowGraph } from '@core/types'
+import type { RunStepOptions, UserActionPayload, WorkflowGraph } from '@core/types'
 import type { AppService } from './service'
 
 export function registerIpc(service: AppService, getWindow: () => BrowserWindow | null): void {
@@ -47,6 +47,7 @@ export function registerIpc(service: AppService, getWindow: () => BrowserWindow 
   ipcMain.handle('deleteRun', (_event, runId: string) => service.deleteRun(runId))
   ipcMain.handle('createRun', (_event, workflowId: string) => service.createRun(workflowId))
   ipcMain.handle('duplicateRun', (_event, runId: string) => service.duplicateRun(runId))
+  ipcMain.handle('resetRun', (_event, runId: string) => service.resetRun(runId))
   ipcMain.handle('getRun', (_event, runId: string) => service.getRun(runId))
   ipcMain.handle('updateRunInputs', (_event, runId: string, inputs: Record<string, unknown>) => service.updateRunInputs(runId, inputs))
   ipcMain.handle('updateRunTitle', (_event, runId: string, title: string) => service.updateRunTitle(runId, title))
@@ -60,7 +61,7 @@ export function registerIpc(service: AppService, getWindow: () => BrowserWindow 
   ipcMain.handle('retryStep', (_event, runId: string, stepId: string, branchId: string) => service.retryStep(runId, stepId, branchId))
   ipcMain.handle(
     'runStep',
-    (_event, runId: string, stepId: string, branchId: string, mode: 'only' | 'chain', options?: { appendBatch?: boolean }) =>
+    (_event, runId: string, stepId: string, branchId: string, mode: 'only' | 'chain', options?: RunStepOptions) =>
       service.runStep(runId, stepId, branchId, mode, options)
   )
   ipcMain.handle('skipStep', (_event, runId: string, stepId: string, branchId: string) => service.skipStep(runId, stepId, branchId))

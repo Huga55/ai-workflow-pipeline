@@ -9,6 +9,7 @@ import type {
   AIResponse,
   ManualOption,
   StepDefinition,
+  StepMessageProgress,
   StepOutcome,
   VariableContext,
   WorkflowGraph
@@ -22,6 +23,8 @@ export type StepRunContext = {
   runId: string
   branchId: string
   signal?: AbortSignal
+  fromMessageId?: string
+  onMessages?: (messages: StepMessageProgress[]) => void
   collectOutputs?: (fanoutStepId: string, fromStepId: string) => unknown[]
 }
 
@@ -55,7 +58,10 @@ export function createRunners(deps: RunnerDeps = {}): Record<StepDefinition['typ
       return runAiStep(config, ctx.ctx, generate, ctx.signal, {
         runtime,
         runId: ctx.runId,
-        branchId
+        branchId,
+        sharedMessages: ctx.graph.sharedMessages,
+        fromMessageId: ctx.fromMessageId,
+        onMessages: ctx.onMessages
       })
     }
   }

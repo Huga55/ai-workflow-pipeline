@@ -1,4 +1,5 @@
 import { isStoredFile, isTextWithFiles, textWithFilesDisplay } from '@core/media'
+import { isSharedRef } from '@core/shared-messages'
 import { effectiveStep } from '@core/step-ref'
 import type { ContentPart, NamedVariable, VariableContext, VariableVersion, WorkflowGraph, StepDefinition } from '@core/types'
 
@@ -138,6 +139,19 @@ export function isPresent(value: unknown): boolean {
   return true
 }
 
+export function templatePaths(template: string): string[] {
+  const paths: string[] = []
+  const flags = new RegExp(TOKEN.source, 'g')
+  let match: RegExpExecArray | null
+  while ((match = flags.exec(template))) {
+    const inner = match[1].trim()
+    if (inner === '/if' || inner.startsWith('/') || (inner.startsWith('#') && !inner.startsWith('#if'))) continue
+    const path = inner.startsWith('#if') ? inner.slice(3).trim() : inner
+    if (path) paths.push(path)
+  }
+  return paths
+}
+
 export function validateTemplate(template: string): string[] {
   const errors: string[] = []
   const stack: string[] = []
@@ -174,7 +188,9 @@ export function templatesInStep(step: StepDefinition, steps: StepDefinition[] = 
   if (step.iterate?.over) out.push(step.iterate.over)
   switch (resolved.type) {
     case 'ai':
-      for (const message of resolved.config.messages) out.push(message.content)
+      for (const message of resolved.config.messages) {
+        if (!isSharedRef(message)) out.push(message.content)
+      }
       break
     case 'transform':
       if (resolved.config.template) out.push(resolved.config.template)
@@ -206,6 +222,18 @@ export function validateWorkflowTemplates(graph: WorkflowGraph): string[] {
       errors.push(`Фрагмент «${snippet.key}»: ${issue}`)
     }
   }
+  for (const shared of graph.sharedMessages ?? []) {
+    const label = shared.name || shared.key
+    for (const issue of validateTemplate(shared.content)) {
+      errors.push(`Общее сообщение «${label}»: ${issue}`)
+    }
+    if (shared.when && !shared.when.paths.length) {
+      errors.push(`Общее сообщение «${label}»: условие без переменных`)
+    }
+    for (const path of shared.when?.paths ?? []) {
+      if (!parsePath(path)) errors.push(`Общее сообщение «${label}»: некорректный путь «${path}» в условии`)
+    }
+  }
   for (const chat of graph.chats ?? []) {
     for (const issue of validateTemplate(chat.instruction)) {
       errors.push(`Чат «${chat.key}»: ${issue}`)
@@ -220,7 +248,7 @@ export function validateWorkflowTemplates(graph: WorkflowGraph): string[] {
     }
     if (step.type === 'ai') {
       step.config.messages.forEach((message, index) => {
-        if (!message.when) return
+        if (isSharedRef(message) || !message.when) return
         if (!message.when.paths.length) {
           errors.push(`Шаг «${step.name}»: у сообщения ${index + 1} условие без переменных`)
         }

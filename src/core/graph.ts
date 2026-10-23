@@ -1,3 +1,4 @@
+import { isSharedRef, resolveMessage } from '@core/shared-messages'
 import { sideChains } from '@core/side-branch'
 import { effectiveStep } from '@core/step-ref'
 import type { StepDefinition, WorkflowGraph } from '@core/types'
@@ -36,6 +37,15 @@ export function innerDependents(stepId: string, steps: StepDefinition[]): StepDe
     stack.push(...(children.get(next.id) ?? []))
   }
   return out
+}
+
+/** Самое внутреннее ветвление, внутри которого выполняется шаг. */
+export function owningFanoutId(stepId: string, steps: StepDefinition[]): string | null {
+  const owners = steps.filter((step) => step.iterate && fanoutInnerSteps(step.id, steps).some((inner) => inner.id === stepId))
+  const inner = owners.find(
+    (owner) => !owners.some((other) => other.id !== owner.id && fanoutInnerSteps(other.id, steps).some((item) => item.id === owner.id))
+  )
+  return inner?.id ?? null
 }
 
 export function fanoutInnerSteps(stepId: string, steps: StepDefinition[]): StepDefinition[] {
@@ -242,6 +252,12 @@ export function validateGraph(graph: WorkflowGraph): string[] {
     if (snippetKeys.has(snippet.key)) errors.push(`Повторяется ключ фрагмента «${snippet.key}»`)
     snippetKeys.add(snippet.key)
   }
+  const sharedKeys = new Set<string>()
+  for (const shared of graph.sharedMessages ?? []) {
+    if (!KEY.test(shared.key)) errors.push(`Некорректный ключ общего сообщения «${shared.key}»`)
+    if (sharedKeys.has(shared.key)) errors.push(`Повторяется ключ общего сообщения «${shared.key}»`)
+    sharedKeys.add(shared.key)
+  }
   const runtime = graph.runtime ?? 'api'
   const chatKeys = new Set<string>()
   for (const chat of graph.chats ?? []) {
@@ -286,10 +302,20 @@ export function validateGraph(graph: WorkflowGraph): string[] {
       if (typeof resolved.config.jsonSchema !== 'object') errors.push(`JSON Schema шага «${step.name}» должна быть объектом`)
     }
     if (resolved.type === 'ai' && !step.use) {
+      for (const message of resolved.config.messages) {
+        if (!isSharedRef(message)) continue
+        if (!sharedKeys.has(message.shared)) {
+          errors.push(`Шаг «${step.name}» ссылается на неизвестное общее сообщение «${message.shared}»`)
+        }
+      }
       if (runtime === 'playwright') {
         if (!resolved.config.chat) errors.push(`Шаг «${step.name}» не указывает чат`)
         else if (!chatKeys.has(resolved.config.chat)) errors.push(`Шаг «${step.name}» ссылается на неизвестный чат «${resolved.config.chat}»`)
-        if (resolved.config.messages.some((message) => message.role !== 'user')) {
+        const foreign = resolved.config.messages.some((message) => {
+          const body = resolveMessage(message, graph.sharedMessages ?? [])
+          return body !== null && body.role !== 'user'
+        })
+        if (foreign) {
           errors.push(`Шаг «${step.name}»: в playwright-чате сообщение только с ролью user. Инструкция живёт в чате.`)
         }
       } else if (resolved.config.chat) {

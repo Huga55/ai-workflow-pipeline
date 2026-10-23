@@ -20,6 +20,7 @@ const api: PipelineApi = {
   deleteRun: (runId) => ipcRenderer.invoke('deleteRun', runId),
   createRun: (workflowId) => ipcRenderer.invoke('createRun', workflowId),
   duplicateRun: (runId) => ipcRenderer.invoke('duplicateRun', runId),
+  resetRun: (runId) => ipcRenderer.invoke('resetRun', runId),
   getRun: (runId) => ipcRenderer.invoke('getRun', runId),
   updateRunInputs: (runId, inputs) => ipcRenderer.invoke('updateRunInputs', runId, inputs),
   updateRunTitle: (runId, title) => ipcRenderer.invoke('updateRunTitle', runId, title),

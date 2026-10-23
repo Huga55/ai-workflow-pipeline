@@ -1,7 +1,8 @@
-import { createContext, useContext, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
+import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { isStoredFile, isTextWithFiles, storedFiles, toMediaUrl } from '@core/media'
 import { pretty } from '@core/labels'
+import type { MissingVariable } from '@core/missing-variables'
 import { variableCatalog, type VariablePools } from '@core/variables'
 import type { StepDefinition, WorkflowGraph } from '@core/types'
 
@@ -73,6 +74,60 @@ export function JsonView({ value }: { value: unknown }) {
 }
 
 export const VariablePoolsContext = createContext<VariablePools>({})
+export const MissingVariablesContext = createContext<MissingVariable[]>([])
+export const MissingFocusContext = createContext<{ fieldId: string; nonce: number } | null>(null)
+
+export function useMissing(fieldId?: string): MissingVariable[] {
+  const issues = useContext(MissingVariablesContext)
+  if (!fieldId) return []
+  return issues.filter((issue) => issue.fieldId === fieldId)
+}
+
+function locateToken(value: string, path: string): [number, number] | null {
+  const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = new RegExp(`\\{\\{\\s*(?:#if\\s+)?${escaped}\\s*\\}\\}|${escaped}`).exec(value)
+  if (!match) return null
+  return [match.index, match.index + match[0].length]
+}
+
+export function useMissingSelection(
+  fieldId: string | undefined,
+  value: string,
+  ref: { current: HTMLTextAreaElement | HTMLInputElement | null }
+) {
+  const focus = useContext(MissingFocusContext)
+  const issues = useMissing(fieldId)
+  const seen = useRef('')
+  useEffect(() => {
+    if (!fieldId || !focus || focus.fieldId !== fieldId || !ref.current) return
+    const mark = String(focus.nonce)
+    if (seen.current === mark) return
+    seen.current = mark
+    const path = issues[0]?.path
+    ref.current.focus()
+    if (!path) return
+    const span = locateToken(ref.current.value || value, path)
+    if (span) ref.current.setSelectionRange(span[0], span[1])
+  }, [focus, fieldId, value, issues, ref])
+}
+
+export function MissingNote({ fieldId }: { fieldId?: string }) {
+  const issues = useMissing(fieldId)
+  if (!issues.length) return null
+  return (
+    <p className="missing-note">
+      {issues.length === 1 ? 'Здесь нет переменной ' : 'Здесь нет переменных '}
+      {issues.map((issue, index) => (
+        <span key={issue.path}>
+          {index > 0 ? ', ' : null}
+          <code>{`{{${issue.path}}}`}</code>
+        </span>
+      ))}
+      .
+      {issues.map((issue) => (issue.hint ? <span key={`${issue.path}:hint`}> {issue.hint}</span> : null))}
+    </p>
+  )
+}
 
 export function clipboardPlainText(data: DataTransfer | null): string | null {
   if (!data) return null
@@ -114,6 +169,8 @@ export function installPlainPaste(): () => void {
   return () => window.removeEventListener('paste', onPaste, true)
 }
 
+type PickerPlace = { left: number; width: number; maxHeight: number; top?: number; bottom?: number }
+
 export function VariablePicker({
   graph,
   step,
@@ -124,35 +181,149 @@ export function VariablePicker({
   onPick: (path: string) => void
 }) {
   const [open, setOpen] = useState(false)
+  const [tab, setTab] = useState('')
+  const [place, setPlace] = useState<PickerPlace | null>(null)
+  const buttonRef = useRef<HTMLButtonElement>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
+  const tabsRef = useRef<HTMLDivElement>(null)
   const pools = useContext(VariablePoolsContext)
-  const groups = variableCatalog(graph, step, pools)
+  const groups = variableCatalog(graph, step, pools).filter((group) => group.items.length > 0)
+  const current = groups.find((group) => group.title === tab) ?? groups[0]
+
+  function reposition() {
+    const button = buttonRef.current
+    if (!button) return
+    const rect = button.getBoundingClientRect()
+    const margin = 8
+    const gap = 6
+    const width = Math.min(420, window.innerWidth - margin * 2)
+    let left = rect.left
+    if (left + width > window.innerWidth - margin) left = window.innerWidth - margin - width
+    if (left < margin) left = margin
+    const spaceBelow = window.innerHeight - rect.bottom - margin - gap
+    const spaceAbove = rect.top - margin - gap
+    const openUp = spaceAbove > spaceBelow
+    const maxHeight = Math.min(380, Math.max(0, openUp ? spaceAbove : spaceBelow))
+    setPlace(
+      openUp
+        ? { left, width, maxHeight, top: undefined, bottom: window.innerHeight - rect.top + gap }
+        : { left, width, maxHeight, top: rect.bottom + gap, bottom: undefined }
+    )
+  }
+
+  useLayoutEffect(() => {
+    if (!open) return
+    reposition()
+  }, [open])
+
+  useEffect(() => {
+    if (!open) return
+    const onScroll = () => reposition()
+    window.addEventListener('resize', onScroll)
+    window.addEventListener('scroll', onScroll, true)
+    const onPointer = (event: PointerEvent) => {
+      const target = event.target
+      if (!(target instanceof Node)) return
+      if (buttonRef.current?.contains(target) || panelRef.current?.contains(target)) return
+      setOpen(false)
+    }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('pointerdown', onPointer)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('resize', onScroll)
+      window.removeEventListener('scroll', onScroll, true)
+      document.removeEventListener('pointerdown', onPointer)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+
+  useEffect(() => {
+    const row = tabsRef.current
+    if (!open || !row) return
+    const onWheel = (event: WheelEvent) => {
+      if (row.scrollWidth <= row.clientWidth + 1) return
+      const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY
+      if (!delta) return
+      event.preventDefault()
+      row.scrollLeft += delta
+    }
+    row.addEventListener('wheel', onWheel, { passive: false })
+    return () => row.removeEventListener('wheel', onWheel)
+  }, [open, groups.length])
+
+  useEffect(() => {
+    if (!open) return
+    tabsRef.current?.querySelector<HTMLButtonElement>('.on')?.scrollIntoView({ inline: 'nearest', block: 'nearest' })
+  }, [open, current?.title])
+
   return (
     <div className="picker">
-      <button type="button" className="ghost" onClick={() => setOpen((value) => !value)}>
-        Вставить переменную
+      <button
+        ref={buttonRef}
+        type="button"
+        className="ghost"
+        onClick={() => {
+          if (!open) reposition()
+          setOpen((value) => !value)
+        }}
+      >
+        Добавить переменную
       </button>
-      {open && (
-        <div className="picker-panel">
-          {groups.map((group) => (
-            <div key={group.title}>
-              <p className="section-label">{group.title}</p>
-              {group.items.map((item) => (
-                <button
-                  key={item.path}
-                  type="button"
-                  onClick={() => {
-                    onPick(item.path)
-                    setOpen(false)
-                  }}
-                >
-                  <span>{item.label}</span>
-                  <code>{item.path}</code>
-                </button>
-              ))}
-            </div>
-          ))}
-        </div>
-      )}
+      {open &&
+        place &&
+        createPortal(
+          <div
+            ref={panelRef}
+            className="picker-panel"
+            style={{
+              left: place.left,
+              width: place.width,
+              maxHeight: place.maxHeight,
+              top: place.top ?? 'auto',
+              bottom: place.bottom ?? 'auto'
+            }}
+          >
+            {groups.length > 0 && current ? (
+              <>
+                <div ref={tabsRef} className="picker-tabs" role="tablist">
+                  {groups.map((group) => (
+                    <button
+                      key={group.title}
+                      type="button"
+                      role="tab"
+                      aria-selected={group.title === current.title}
+                      className={group.title === current.title ? 'on' : undefined}
+                      onClick={() => setTab(group.title)}
+                    >
+                      {group.title}
+                    </button>
+                  ))}
+                </div>
+                <div className="picker-items" role="tabpanel" style={{ maxHeight: Math.max(0, place.maxHeight - 52) }}>
+                  {current.items.map((item) => (
+                    <button
+                      key={item.path}
+                      type="button"
+                      onClick={() => {
+                        onPick(item.path)
+                        setOpen(false)
+                      }}
+                    >
+                      <span>{item.label}</span>
+                      <code>{item.path}</code>
+                    </button>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <p className="meta">Нет переменных.</p>
+            )}
+          </div>,
+          document.body
+        )}
     </div>
   )
 }
@@ -164,7 +335,8 @@ export function TemplateField({
   graph,
   step,
   rows = 5,
-  readOnly = false
+  readOnly = false,
+  fieldId
 }: {
   label: string
   value: string
@@ -173,12 +345,16 @@ export function TemplateField({
   step?: StepDefinition
   rows?: number
   readOnly?: boolean
+  fieldId?: string
 }) {
   const ref = useRef<HTMLTextAreaElement>(null)
+  const missing = useMissing(fieldId)
+  useMissingSelection(fieldId, value, ref)
   return (
-    <label className="field">
+    <label className={missing.length ? 'field has-missing' : 'field'}>
       <span>{label}</span>
       <textarea ref={ref} rows={rows} value={value} disabled={readOnly} onChange={(event) => onChange(event.target.value)} />
+      <MissingNote fieldId={fieldId} />
       {!readOnly && (
         <VariablePicker
           graph={graph}

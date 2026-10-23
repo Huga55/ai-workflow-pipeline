@@ -68,11 +68,28 @@ export type MessageWhen = {
   paths: string[]
 }
 
-export type AIMessageDraft = {
+export type AIMessageBody = {
   id: string
   role: 'system' | 'user' | 'assistant'
   content: string
   /** Сообщение уходит целиком только если переменные заполнены. Без поля уходит всегда. */
+  when?: MessageWhen
+}
+
+/** В шаге только ссылка: роль, текст и условие живут в общем сообщении. Меняется положение в списке. */
+export type AIMessageRef = {
+  id: string
+  shared: string
+}
+
+export type AIMessageDraft = AIMessageBody | AIMessageRef
+
+export type SharedMessage = {
+  id: string
+  key: string
+  name: string
+  role: AIMessageBody['role']
+  content: string
   when?: MessageWhen
 }
 
@@ -208,6 +225,8 @@ export type WorkflowGraph = {
   inputs: InputDefinition[]
   /** Переиспользуемые куски текста для промптов: {{snippets.ключ}} */
   snippets?: WorkflowSnippet[]
+  /** Сообщения, которые шаги вставляют ссылкой. В шаге у такой ссылки меняется только положение. */
+  sharedMessages?: SharedMessage[]
   /** Преднастройка чатов. Только для runtime playwright. */
   chats?: WorkflowChat[]
   steps: StepDefinition[]
@@ -311,6 +330,21 @@ export type ManualWaiting = {
   skipStepIds?: string[]
 }
 
+export type StepMessageStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped'
+
+/** Ход одного сообщения AI-шага внутри попытки. */
+export type StepMessageProgress = {
+  id: string
+  status: StepMessageStatus
+  error?: string
+}
+
+export type RunStepOptions = {
+  appendBatch?: boolean
+  /** С какого сообщения слать ход в чат. Более ранние заново не уходят. */
+  fromMessageId?: string
+}
+
 export type ExecutionMeta = {
   fanoutError?: boolean
   fanoutResolved?: boolean
@@ -322,6 +356,7 @@ export type ExecutionMeta = {
   provider?: string
   repairedJson?: boolean
   manualAnswer?: boolean
+  messages?: StepMessageProgress[]
 }
 
 export type StepOutcome = {

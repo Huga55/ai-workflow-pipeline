@@ -68,6 +68,78 @@ export function builderFlowLayout(steps: StepDefinition[]): BuilderFlowLayout {
   return { blocks, orphans }
 }
 
+/**
+ * Ставит шаг сразу после зависимости.
+ * Доп. ветки одного шага идут целыми блоками одна за другой,
+ * следующий шаг основной колонки — после всех таких веток.
+ * При цикле порядок не меняется.
+ */
+export function placeStepAfterDependency(steps: StepDefinition[], stepId: string): StepDefinition[] {
+  const subject = steps.find((step) => step.id === stepId)
+  if (!subject || !topoSort(steps).ok) return steps
+
+  const anchor = latestDependency(subject, steps)
+  // Корень доп. ветки сохраняет место среди других веток той же опоры: новый шаг и так последний по order.
+  const provisional = subject.sideBranch ? subject.order : anchor ? anchor.order + 0.5 : 0
+  const adjusted = steps.map((step) => (step.id === stepId ? { ...step, order: provisional } : step))
+  const sequence = sequenceForOrders(builderFlowLayout(adjusted), adjusted)
+  if (sequence.length !== steps.length) return steps
+
+  const byId = new Map(steps.map((step) => [step.id, step]))
+  return sequence.map((step, index) => {
+    const original = byId.get(step.id) ?? step
+    const order = index + 1
+    return original.order === order ? original : { ...original, order }
+  })
+}
+
+function sequenceForOrders(layout: BuilderFlowLayout, steps: StepDefinition[]): StepDefinition[] {
+  const sequence: StepDefinition[] = []
+  for (const block of layout.blocks) {
+    sequence.push(block.step)
+    for (const side of block.sides) sequence.push(...side.steps)
+  }
+  const pending = [...layout.orphans]
+  const chains = sideChains(steps)
+  while (pending.length) {
+    const ready = pending.findIndex((side) =>
+      side.root.dependsOn.every((id) => sequence.some((step) => step.id === id) || !pending.some((other) => other.steps.some((step) => step.id === id)))
+    )
+    const [side] = pending.splice(ready >= 0 ? ready : 0, 1)
+    insertAfterDependency(sequence, side.steps, side.root.dependsOn, chains)
+  }
+  return sequence
+}
+
+function insertAfterDependency(sequence: StepDefinition[], block: StepDefinition[], dependsOn: string[], chains: ReturnType<typeof sideChains>) {
+  let anchorIndex = -1
+  for (const id of dependsOn) {
+    const index = sequence.findIndex((step) => step.id === id)
+    if (index > anchorIndex) anchorIndex = index
+  }
+  if (anchorIndex < 0) {
+    sequence.push(...block)
+    return
+  }
+  const chain = chains.find((item) => item.stepIds.includes(sequence[anchorIndex].id))
+  let end = anchorIndex
+  if (chain) {
+    while (end + 1 < sequence.length && chain.stepIds.includes(sequence[end + 1].id)) end += 1
+  }
+  sequence.splice(end + 1, 0, ...block)
+}
+
+function latestDependency(step: StepDefinition, steps: StepDefinition[]): StepDefinition | null {
+  const byId = new Map(steps.map((item) => [item.id, item]))
+  let best: StepDefinition | null = null
+  for (const id of step.dependsOn) {
+    const dep = byId.get(id)
+    if (!dep) continue
+    if (!best || dep.order > best.order || (dep.order === best.order && dep.name.localeCompare(best.name) > 0)) best = dep
+  }
+  return best
+}
+
 function primaryParent(root: StepDefinition, mainOrder: Map<string, number>): string | null {
   const candidates = root.dependsOn.filter((id) => mainOrder.has(id))
   if (!candidates.length) return null

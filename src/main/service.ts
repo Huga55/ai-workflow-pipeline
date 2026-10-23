@@ -11,7 +11,7 @@ import { isAbortError, settleRunStatus, WorkflowEngine, type OpenChatsRequest } 
 import { interpolateParts, latestVariableVersion } from '@core/variables'
 import { createRunners } from '@core/runners'
 import { createNeurophotoGraph } from '@core/template'
-import type { AIRequest, AIResponse, NamedVariable, Project, ProviderStatus, RunDetails, StoredFile, UserActionPayload, WorkflowDetails, WorkflowDraft, WorkflowGraph } from '@core/types'
+import type { AIRequest, AIResponse, NamedVariable, Project, ProviderStatus, RunDetails, RunStepOptions, StoredFile, UserActionPayload, WorkflowDetails, WorkflowDraft, WorkflowGraph } from '@core/types'
 import { AppDatabase, SqliteEngineStore } from './db'
 import { createProvider, PROVIDERS } from './providers'
 import { QwenBrowser } from './qwen-browser'
@@ -312,14 +312,26 @@ export class AppService {
     return this.database.getRun(id)
   }
 
+  async resetRun(runId: string): Promise<RunDetails> {
+    if (this.active.has(runId)) throw new Error('Этот запуск сейчас выполняется. Сначала остановите его.')
+    const details = this.database.getRun(runId)
+    const latest = this.database.latestVersion(details.run.workflowId)
+    const inputs = normalizeInputs(latest.graph, details.run.inputs)
+    this.database.resetRun(runId, latest.id, inputs, nowIso())
+    await this.qwen.forgetRun(runId).catch(() => undefined)
+    this.onRunUpdated(runId)
+    return this.database.getRun(runId)
+  }
+
   getRun(runId: string): RunDetails {
     if (!this.active.has(runId)) this.restoreStopped(runId)
     return this.database.getRun(runId)
   }
 
   updateRunInputs(runId: string, inputs: Record<string, unknown>): RunDetails {
-    const details = this.database.getRun(runId)
-    if (details.executions.length) throw new Error('Входы нельзя менять после старта запуска')
+    if (this.active.has(runId)) throw new Error('Этот запуск сейчас выполняется. Сначала остановите его.')
+    const details = this.getRun(runId)
+    if (details.run.status === 'running') throw new Error('Этот запуск сейчас выполняется. Сначала остановите его.')
     this.database.updateRunInputs(runId, normalizeInputs(details.graph, inputs), nowIso())
     return this.database.getRun(runId)
   }
@@ -475,10 +487,13 @@ export class AppService {
     stepId: string,
     branchId: string,
     mode: 'only' | 'chain',
-    options?: { appendBatch?: boolean }
+    options?: RunStepOptions
   ): Promise<RunDetails> {
     this.guardRunnable(runId)
-    return this.advance(runId, { focus: { stepId, branchId, mode }, appendBatch: options?.appendBatch })
+    return this.advance(runId, {
+      focus: { stepId, branchId, mode, fromMessageId: options?.fromMessageId },
+      appendBatch: options?.appendBatch
+    })
   }
 
   async skipStep(runId: string, stepId: string, branchId: string): Promise<RunDetails> {
@@ -615,26 +630,25 @@ export class AppService {
   private async openPlaywrightChats(runId: string, request: OpenChatsRequest, signal?: AbortSignal): Promise<void> {
     const graph = this.database.getRun(runId).graph
     if ((graph.runtime ?? 'api') !== 'playwright') return
-    for (const chat of graph.chats ?? []) {
-      if (chat.scope !== request.scope) continue
-      this.database.markRunChat(runId, chat.key, request.branchId, 'running', '')
+    const chat = (graph.chats ?? []).find((item) => item.key === request.chatKey && item.scope === request.scope)
+    if (!chat) return
+    this.database.markRunChat(runId, chat.key, request.branchId, 'running', '')
+    this.onRunUpdated(runId)
+    try {
+      await this.qwen.ensure({
+        runId,
+        chatKey: chat.key,
+        branchId: request.branchId,
+        parts: interpolateParts(chat.instruction, request.ctx),
+        signal
+      })
+      this.database.markRunChat(runId, chat.key, request.branchId, 'completed', '')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Не удалось открыть чат'
+      this.database.markRunChat(runId, chat.key, request.branchId, 'failed', message)
+      throw error
+    } finally {
       this.onRunUpdated(runId)
-      try {
-        await this.qwen.ensure({
-          runId,
-          chatKey: chat.key,
-          branchId: request.branchId,
-          parts: interpolateParts(chat.instruction, request.ctx),
-          signal
-        })
-        this.database.markRunChat(runId, chat.key, request.branchId, 'completed', '')
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'Не удалось открыть чат'
-        this.database.markRunChat(runId, chat.key, request.branchId, 'failed', message)
-        throw error
-      } finally {
-        this.onRunUpdated(runId)
-      }
     }
   }
 
@@ -683,7 +697,7 @@ export class AppService {
       startManualBranches?: boolean
       note?: string
       retry?: { stepId: string; branchId: string }
-      focus?: { stepId: string; branchId: string; mode: 'only' | 'chain' }
+      focus?: { stepId: string; branchId: string; mode: 'only' | 'chain'; fromMessageId?: string }
       appendBatch?: boolean
     }
   ): Promise<RunDetails> {

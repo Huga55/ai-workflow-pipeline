@@ -2,6 +2,8 @@ import { mkdirSync } from 'node:fs'
 import path from 'node:path'
 import { DatabaseSync, type SQLOutputValue, type StatementSync } from 'node:sqlite'
 import type { Bundle, BundleChat, BundleDraft, BundleProject } from '@core/bundle'
+import { owningFanoutId } from '@core/graph'
+import { effectiveStep } from '@core/step-ref'
 import type { EngineStore } from '@core/store'
 import type {
   Artifact,
@@ -485,6 +487,28 @@ export class AppDatabase {
 
   updateRunInputs(runId: string, inputs: Record<string, unknown>, updatedAt: string): void {
     this.run(`UPDATE runs SET inputs_json = ?, updated_at = ? WHERE id = ?`, JSON.stringify(inputs), updatedAt, runId)
+  }
+
+  resetRun(runId: string, versionId: string, inputs: Record<string, unknown>, updatedAt: string): void {
+    this.db.exec('BEGIN')
+    try {
+      this.run(`DELETE FROM artifacts WHERE run_id = ?`, runId)
+      this.run(`DELETE FROM user_actions WHERE run_id = ?`, runId)
+      this.run(`DELETE FROM run_chats WHERE run_id = ?`, runId)
+      this.run(`DELETE FROM branches WHERE run_id = ?`, runId)
+      this.run(`DELETE FROM step_executions WHERE run_id = ?`, runId)
+      this.run(
+        `UPDATE runs SET workflow_version_id = ?, inputs_json = ?, status = 'draft', error = NULL, updated_at = ? WHERE id = ?`,
+        versionId,
+        JSON.stringify(inputs),
+        updatedAt,
+        runId
+      )
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   updateRunTitle(runId: string, title: string, updatedAt: string): void {
@@ -1274,6 +1298,23 @@ type BranchRow = {
   status: string
 }
 
+function expectedChatOpens(graph: WorkflowGraph, chatKey: string, scope: 'run' | 'branch', branches: Branch[]): number {
+  const users = graph.steps.filter((step) => {
+    const resolved = effectiveStep(step, graph.steps)
+    return resolved.type === 'ai' && resolved.config.chat === chatKey
+  })
+  if (!users.length) return 0
+  if (scope !== 'branch') return 1
+  const fanoutIds = new Set<string>()
+  let root = false
+  for (const user of users) {
+    const owner = owningFanoutId(user.id, graph.steps)
+    if (owner) fanoutIds.add(owner)
+    else root = true
+  }
+  return branches.filter((branch) => fanoutIds.has(branch.sourceStepId)).length + (root ? 1 : 0)
+}
+
 function mapBranch(row: BranchRow): Branch {
   return {
     id: row.id,
@@ -1301,12 +1342,17 @@ function chatViews(
     const related = rows.filter((item) => item.chatKey === chat.key && (chat.scope === 'run' ? item.branchId === '' : item.branchId !== ''))
     const error = related.find((item) => item.error)?.error || null
     const opened = related.filter((item) => item.status === 'completed').length
-    const expected = chat.scope === 'branch' ? branches.length : 1
+    const expected = expectedChatOpens(graph, chat.key, chat.scope, branches)
     let status: RunChatStatus = 'pending'
     if (related.some((item) => item.status === 'running')) status = 'running'
     else if (related.some((item) => item.status === 'failed')) status = 'failed'
     else if (expected > 0 && opened >= expected) status = 'completed'
-    const label = chat.scope === 'branch' ? (expected ? `${opened} из ${expected} веток` : 'в каждой ветке') : 'на запуск'
+    const label =
+      expected === 0
+        ? 'когда шаг его использует'
+        : chat.scope === 'branch'
+          ? `${opened} из ${expected} веток`
+          : 'на запуск'
     const addresses = related.filter((item) => item.url).map((item) => ({ branchId: item.branchId, url: item.url }))
     return {
       key: chat.key,

@@ -15,6 +15,7 @@ import type {
   MessageWhen,
   ParseStepConfig,
   StepDefinition,
+  SharedMessage,
   StepType,
   TransformStepConfig,
   WorkflowChat,
@@ -50,7 +51,7 @@ const MANUAL_MODES = new Set<ManualMode>([
 const TRANSFORM_MODES = new Set<TransformStepConfig['mode']>(['template', 'extract', 'filter', 'script'])
 const FILTER_OPS = new Set<NonNullable<TransformStepConfig['op']>>(['eq', 'neq', 'contains', 'truthy'])
 const PARSE_MODES = new Set<ParseStepConfig['mode']>(['json', 'regex', 'delimiter'])
-const ROLES = new Set<AIMessageDraft['role']>(['system', 'user', 'assistant'])
+const ROLES = new Set<SharedMessage['role']>(['system', 'user', 'assistant'])
 
 export type WorkflowJsonDocument = {
   name: string
@@ -68,10 +69,23 @@ export function formatWorkflowJson(document: WorkflowJsonDocument): string {
   if (document.graph.runtime === 'playwright') payload.runtime = 'playwright'
   payload.inputs = document.graph.inputs
   if (document.graph.snippets?.length) payload.snippets = document.graph.snippets
+  if (document.graph.sharedMessages?.length) payload.sharedMessages = document.graph.sharedMessages.map(formatSharedMessage)
   if (document.graph.chats?.length) payload.chats = document.graph.chats
   const keyById = new Map(document.graph.steps.map((step) => [step.id, step.key]))
   payload.steps = document.graph.steps.map((step) => formatStep(step, keyById))
   return JSON.stringify(payload, null, 2)
+}
+
+function formatSharedMessage(message: SharedMessage): Record<string, unknown> {
+  const out: Record<string, unknown> = {
+    id: message.id,
+    key: message.key,
+    name: message.name,
+    role: message.role,
+    content: message.content
+  }
+  if (message.when) out.when = message.when
+  return out
 }
 
 function formatStep(step: StepDefinition, keyById: Map<string, string>): Record<string, unknown> {
@@ -111,12 +125,13 @@ export function parseWorkflowJson(text: string, options: WorkflowJsonParseOption
   if (!isRecord(raw)) return { ok: false, errors: ['Корень JSON должен быть объектом с полями name, description, inputs и steps'] }
 
   const errors: string[] = []
-  onlyKeys(raw, ['name', 'description', 'runtime', 'inputs', 'snippets', 'chats', 'steps'], 'корень', errors)
+  onlyKeys(raw, ['name', 'description', 'runtime', 'inputs', 'snippets', 'sharedMessages', 'chats', 'steps'], 'корень', errors)
   const name = readString(raw, 'name', 'name', errors, '') ?? ''
   const description = readString(raw, 'description', 'description', errors, '') ?? ''
   if (!Array.isArray(raw.inputs)) errors.push('inputs должен быть массивом')
   if (!Array.isArray(raw.steps)) errors.push('steps должен быть массивом')
   if ('snippets' in raw && !Array.isArray(raw.snippets)) errors.push('snippets должен быть массивом')
+  if ('sharedMessages' in raw && !Array.isArray(raw.sharedMessages)) errors.push('sharedMessages должен быть массивом')
   if ('chats' in raw && !Array.isArray(raw.chats)) errors.push('chats должен быть массивом')
   const runtime = readEnum(raw, 'runtime', 'runtime', new Set(['api', 'playwright'] as const), errors, 'api')
   if (!Array.isArray(raw.inputs) || !Array.isArray(raw.steps)) return { ok: false, errors }
@@ -141,6 +156,15 @@ export function parseWorkflowJson(text: string, options: WorkflowJsonParseOption
     raw.snippets.forEach((item, index) => {
       const snippet = parseSnippet(item, index, takenSnippetKeys, errors)
       if (snippet) snippets.push(snippet)
+    })
+  }
+
+  const sharedMessages: SharedMessage[] = []
+  const takenSharedKeys = new Set<string>()
+  if (Array.isArray(raw.sharedMessages)) {
+    raw.sharedMessages.forEach((item, index) => {
+      const shared = parseSharedMessage(item, index, takenSharedKeys, session)
+      if (shared) sharedMessages.push(shared)
     })
   }
 
@@ -171,6 +195,7 @@ export function parseWorkflowJson(text: string, options: WorkflowJsonParseOption
     ...(runtime === 'playwright' ? { runtime: 'playwright' as const } : {}),
     inputs,
     ...(snippets.length ? { snippets } : {}),
+    ...(sharedMessages.length ? { sharedMessages } : {}),
     ...(chats.length ? { chats } : {}),
     steps
   }
@@ -216,6 +241,31 @@ function parseSnippet(raw: unknown, index: number, taken: Set<string>, errors: s
   if (taken.has(key)) errors.push(`${path}: повторяется ключ «${key}»`)
   taken.add(key)
   return { key, content }
+}
+
+function parseSharedMessage(raw: unknown, index: number, taken: Set<string>, session: ParseSession): SharedMessage | null {
+  const errors = session.errors
+  const path = `sharedMessages[${index}]`
+  if (!isRecord(raw)) {
+    errors.push(`${path} должен быть объектом`)
+    return null
+  }
+  onlyKeys(raw, ['id', 'key', 'name', 'role', 'content', 'when'], path, errors)
+  const key = readString(raw, 'key', `${path}.key`, errors)?.trim()
+  const role = readEnum(raw, 'role', `${path}.role`, ROLES, errors)
+  const content = readString(raw, 'content', `${path}.content`, errors, '')
+  const name = readString(raw, 'name', `${path}.name`, errors, '')
+  if (!key) {
+    errors.push(`${path}.key: укажите ключ`)
+    return null
+  }
+  if (!role || content === undefined || name === undefined) return null
+  if (taken.has(key)) errors.push(`${path}: повторяется ключ «${key}»`)
+  taken.add(key)
+  const when = parseMessageWhen(raw.when, `${path}.when`, errors)
+  const previous = session.previous?.sharedMessages?.find((item) => item.key === key)
+  const id = assignId(readString(raw, 'id', `${path}.id`, errors), previous?.id, path, session)
+  return when ? { id, key, name: name.trim() || key, role, content, when } : { id, key, name: name.trim() || key, role, content }
 }
 
 function applyUseLinks(steps: StepDefinition[], errors: string[]) {
@@ -431,6 +481,19 @@ function parseAiConfig(
     const messagePath = `${path}.messages[${index}]`
     if (!isRecord(item)) {
       errors.push(`${messagePath} должен быть объектом`)
+      return
+    }
+    if ('shared' in item) {
+      onlyKeys(item, ['id', 'shared'], messagePath, errors)
+      const shared = readString(item, 'shared', `${messagePath}.shared`, errors)?.trim()
+      if (!shared) {
+        errors.push(`${messagePath}.shared: укажите ключ общего сообщения`)
+        return
+      }
+      const id = assignId(readString(item, 'id', `${messagePath}.id`, errors), previousMessages[index]?.id, messagePath, session)
+      if (seen.has(id)) errors.push(`${messagePath}: повторяется id «${id}»`)
+      seen.add(id)
+      messages.push({ id, shared })
       return
     }
     onlyKeys(item, ['id', 'role', 'content', 'when'], messagePath, errors)
@@ -685,6 +748,7 @@ function assignId(explicit: string | undefined, matched: string | undefined, pat
 function knownId(session: ParseSession, id: string): boolean {
   if (!session.previous) return true
   if (session.previous.inputs.some((input) => input.id === id)) return true
+  if (session.previous.sharedMessages?.some((message) => message.id === id)) return true
   return session.previous.steps.some((step) => step.id === id || (step.type === 'ai' && step.config.messages.some((message) => message.id === id)))
 }
 

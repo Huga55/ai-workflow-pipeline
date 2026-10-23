@@ -1,10 +1,12 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { chainStepIds } from '@core/graph'
 import { stepExecution } from '@core/run-layout'
+import { messagePreview, isSharedRef, resolveMessage } from '@core/shared-messages'
 import { pretty } from '@core/labels'
 import { storedFiles } from '@core/media'
 import { runVersionFit, type RunVersionFit } from '@core/run-version'
-import type { RunDetails, StepDefinition, StepExecution, StoredFile, UserActionPayload } from '@core/types'
+import { effectiveStep } from '@core/step-ref'
+import type { RunDetails, StepDefinition, StepExecution, StepMessageStatus, StoredFile, UserActionPayload } from '@core/types'
 import { MediaPicker, attachmentsFromTransfer, type MediaAccept } from '../media-field'
 import { RunCanvas, type CanvasNode } from '../run-canvas'
 import { clipboardHasFiles, copyText, errorText, JsonView, Modal, StatusPill, whenText } from '../ui'
@@ -30,6 +32,7 @@ export function RunPage({
   const [selected, setSelected] = useState<CanvasNode | null>(null)
   const [versions, setVersions] = useState<number[]>([])
   const [versionChoice, setVersionChoice] = useState<{ version: number; fit: RunVersionFit } | null>(null)
+  const [resetOpen, setResetOpen] = useState(false)
 
   async function reload() {
     const next = await window.pipeline.getRun(runId)
@@ -50,6 +53,16 @@ export function RunPage({
     void act(async () => {
       const next = await window.pipeline.setRunVersion(runId, version)
       notify(`Схема запуска: v${version}`)
+      return next
+    })
+  }
+
+  function confirmReset() {
+    setResetOpen(false)
+    setSelected(null)
+    void act(async () => {
+      const next = await window.pipeline.resetRun(runId)
+      notify('Цикл сброшен. Входы сохранены, схема — последняя версия.')
       return next
     })
   }
@@ -77,6 +90,7 @@ export function RunPage({
   if (!details) return <div className="page">{error ? <div className="error">{error}</div> : 'Загрузка…'}</div>
   const { run, graph } = details
   const started = details.executions.length > 0
+  const latestVersion = versions.at(-1) ?? details.versionNumber
 
   return (
     <div className="page wide">
@@ -148,6 +162,11 @@ export function RunPage({
               >
                 {started ? 'Продолжить готовые ветки' : 'Запустить'}
               </button>
+              {typeof window.pipeline.resetRun === 'function' && (
+                <button className="ghost" type="button" disabled={busy} onClick={() => setResetOpen(true)}>
+                  Сбросить цикл
+                </button>
+              )}
               <button
                 className="ghost"
                 type="button"
@@ -166,11 +185,36 @@ export function RunPage({
       </div>
       {error && <div className="error">{error}</div>}
       {run.error && <div className="error">{run.error}</div>}
-      {!started && <InputForm details={details} busy={busy} onSaved={setDetails} onError={setError} />}
+      {graph.inputs.length > 0 && (
+        <InputForm
+          key={`${run.id}:${details.versionNumber}:${details.executions.length}`}
+          details={details}
+          busy={busy || run.status === 'running'}
+          started={started}
+          onSaved={setDetails}
+          onError={setError}
+        />
+      )}
       <div className="run-board">
         <RunCanvas details={details} selectedId={selected?.id ?? null} onSelect={setSelected} />
         <CanvasDock details={details} node={selected} busy={busy} act={act} notify={notify} />
       </div>
+      {resetOpen && (
+        <Modal title="Сбросить цикл" onClose={() => setResetOpen(false)}>
+          <p className="lede">
+            Входные данные этого запуска останутся. Результаты шагов, ветки и чаты удалятся, схема переключится на v{latestVersion}.
+            Продолжить с текущего места уже не получится.
+          </p>
+          <div className="row">
+            <button className="danger" type="button" disabled={busy} onClick={confirmReset}>
+              Сбросить
+            </button>
+            <button className="ghost" type="button" onClick={() => setResetOpen(false)}>
+              Отмена
+            </button>
+          </div>
+        </Modal>
+      )}
       {versionChoice && (
         <Modal title={versionChoice.fit.ok ? `Перейти на v${versionChoice.version}` : 'Версия не подходит'} onClose={() => setVersionChoice(null)}>
           {versionChoice.fit.ok ? (
@@ -209,11 +253,13 @@ export function RunPage({
 function InputForm({
   details,
   busy,
+  started,
   onSaved,
   onError
 }: {
   details: RunDetails
   busy: boolean
+  started: boolean
   onSaved: (details: RunDetails) => void
   onError: (message: string) => void
 }) {
@@ -232,6 +278,12 @@ function InputForm({
   return (
     <div className="panel" style={{ padding: 16, marginTop: 18 }}>
       <h2>Входы запуска</h2>
+      {started && (
+        <p className="field-note">
+          Уже пройденные шаги не пересчитаются. Чтобы прогнать этот запуск заново с этими входами и последней версией пайплайна, нажмите «Сбросить цикл».
+        </p>
+      )}
+      <div className="run-inputs">
       {details.graph.inputs.map((input) => (
         <InputControl
           key={input.id}
@@ -245,7 +297,31 @@ function InputForm({
           onChange={(value) => void save({ ...inputs, [input.name]: value })}
         />
       ))}
+      </div>
     </div>
+  )
+}
+
+function InputBlock({
+  title,
+  description,
+  children,
+  asLabel = true
+}: {
+  title: string
+  description: string
+  children: ReactNode
+  asLabel?: boolean
+}) {
+  const Body = asLabel ? 'label' : 'div'
+  return (
+    <section className="run-input">
+      <Body className="field">
+        <span className="run-input-title">{title}</span>
+        {description ? <p className="field-note">{description}</p> : null}
+        {children}
+      </Body>
+    </section>
   )
 }
 
@@ -272,52 +348,49 @@ function InputControl({
   const title = `${label}${required ? ' *' : ''}`
   if (type === 'text') {
     return (
-      <label className="field">
-        <span>{title}</span>
+      <InputBlock title={title} description={description}>
         <textarea value={typeof value === 'string' ? value : ''} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
-        {description && <span>{description}</span>}
-      </label>
+      </InputBlock>
     )
   }
   if (type === 'boolean') {
     return (
-      <label className="check">
-        <input type="checkbox" checked={Boolean(value)} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
-        {title}
-      </label>
+      <InputBlock title={title} description={description} asLabel={false}>
+        <label className="check">
+          <input type="checkbox" checked={Boolean(value)} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
+          {value ? 'Да' : 'Нет'}
+        </label>
+      </InputBlock>
     )
   }
   if (type === 'number') {
     return (
-      <label className="field">
-        <span>{title}</span>
+      <InputBlock title={title} description={description}>
         <input
           type="number"
           value={typeof value === 'number' ? value : ''}
           disabled={disabled}
           onChange={(event) => onChange(event.target.value === '' ? null : Number(event.target.value))}
         />
-      </label>
+      </InputBlock>
     )
   }
   if (type === 'select') {
     return (
-      <label className="field">
-        <span>{title}</span>
+      <InputBlock title={title} description={description}>
         <select value={typeof value === 'string' ? value : ''} disabled={disabled} onChange={(event) => onChange(event.target.value)}>
           <option value="">Выберите</option>
           {(options ?? []).map((option) => (
             <option key={option}>{option}</option>
           ))}
         </select>
-      </label>
+      </InputBlock>
     )
   }
   if (type === 'multi-select') {
     const selected = Array.isArray(value) ? value.map(String) : []
     return (
-      <div className="field">
-        <span>{title}</span>
+      <InputBlock title={title} description={description} asLabel={false}>
         {(options ?? []).map((option) => (
           <label key={option} className="check">
             <input
@@ -329,13 +402,12 @@ function InputControl({
             {option}
           </label>
         ))}
-      </div>
+      </InputBlock>
     )
   }
   if (type === 'json' || type === 'json[]') {
     return (
-      <label className="field">
-        <span>{title}</span>
+      <InputBlock title={title} description={description}>
         <textarea
           defaultValue={value == null ? '' : JSON.stringify(value, null, 2)}
           disabled={disabled}
@@ -353,31 +425,27 @@ function InputControl({
           }}
         />
         {jsonError && <span>{jsonError}</span>}
-      </label>
+      </InputBlock>
     )
   }
   if (type === 'image' || type === 'file' || type === 'image[]' || type === 'file[]') {
     const multiple = type.endsWith('[]')
     const accept: MediaAccept = type.startsWith('image') ? 'image' : 'file'
     return (
-      <div className="field">
-        <span>{title}</span>
-        {description && <span>{description}</span>}
+      <InputBlock title={title} description={description} asLabel={false}>
         <MediaPicker
           accept={accept}
           files={storedFiles(value)}
           disabled={disabled}
           onChange={(next) => onChange(storedValue(multiple, next))}
         />
-      </div>
+      </InputBlock>
     )
   }
   return (
-    <label className="field">
-      <span>{title}</span>
+    <InputBlock title={title} description={description}>
       <input value={typeof value === 'string' ? value : ''} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
-      {description && <span>{description}</span>}
-    </label>
+    </InputBlock>
   )
 }
 
@@ -458,7 +526,11 @@ function CanvasDock({
           <strong>{node.title}</strong>
           <StatusPill status={chat?.status ?? node.status} />
         </div>
-        <p className="meta">{chat?.scope === 'branch' ? 'Чат создаётся в каждой ветке.' : 'Чат создаётся один раз на запуск.'}</p>
+        <p className="meta">
+          {chat?.scope === 'branch'
+            ? 'Свой чат ветки. Открывается, когда шаг этой ветки его использует.'
+            : 'Один чат на запуск. Открывается, когда шаг впервые его использует.'}
+        </p>
         <p className="meta">{chat?.label}</p>
         {chat?.error && <div className="error">{chat.error}</div>}
         <ChatHashes chat={chat} />
@@ -544,7 +616,21 @@ function ExecutionCard({
     .filter((item) => item.stepId === step.id && item.branchId === (resolved?.branchId ?? branchId))
     .sort((a, b) => b.attempt - a.attempt)
   const [attemptId, setAttemptId] = useState<string | null>(null)
+  const [picked, setPicked] = useState<string | null>(null)
+  useEffect(() => {
+    setAttemptId(null)
+    setPicked(null)
+  }, [step.id, branchId])
   const execution = attempts.find((item) => item.id === attemptId) ?? attempts[0]
+  const latest = attempts[0]
+  const ai = aiConfig(step, details)
+  const rows = ai ? messageRows(ai, details, execution) : []
+  const resumeRows = ai ? messageRows(ai, details, latest) : rows
+  const selectable = Boolean(ai && details.graph.runtime === 'playwright' && rows.length > 1 && details.run.status !== 'running')
+  const fromId = defaultFromId(resumeRows, latest?.status === 'failed', picked)
+  const messages = (
+    <StepMessages rows={rows} selectable={selectable} fromId={fromId} onPick={setPicked} />
+  )
   const artifact = details.artifacts.find((item) => item.stepExecutionId === execution?.id && item.name === 'output')
   if (!execution && !step.iterate) {
     return (
@@ -553,8 +639,16 @@ function ExecutionCard({
           <strong>{step.name}</strong>
           <StatusPill status="pending" />
         </header>
-        {step.type === 'ai' && step.config.chat && <ChatHashLine details={details} chatKey={step.config.chat} branchId={branchId} />}
-        <RunActions details={details} step={step} branchId={branchId} busy={busy} act={act} />
+        {ai?.config.chat && <ChatHashLine details={details} chatKey={ai.config.chat} branchId={branchId} />}
+        {messages}
+        <RunActions
+          details={details}
+          step={step}
+          branchId={branchId}
+          busy={busy}
+          act={act}
+          fromMessageId={selectable ? fromId : undefined}
+        />
       </article>
     )
   }
@@ -565,7 +659,7 @@ function ExecutionCard({
         <strong>{step.name}</strong>
         <StatusPill status={execution.status} />
       </header>
-      {step.type === 'ai' && step.config.chat && <ChatHashLine details={details} chatKey={step.config.chat} branchId={branchId} />}
+      {ai?.config.chat && <ChatHashLine details={details} chatKey={ai.config.chat} branchId={branchId} />}
       <p className="meta">
         Попытка {execution.attempt}
         {execution.durationMs != null ? ` · ${execution.durationMs} мс` : ''}
@@ -582,6 +676,7 @@ function ExecutionCard({
           ))}
         </div>
       )}
+      {messages}
       {execution.error && <div className="error">{execution.error}</div>}
       {execution.status === 'waiting_for_user' && execution.meta.waiting && (
         <ManualForm
@@ -625,9 +720,92 @@ function ExecutionCard({
         </details>
       )}
       {execution.status !== 'running' && execution.status !== 'waiting_for_user' && (
-        <RunActions details={details} step={step} branchId={branchId} busy={busy} act={act} />
+        <RunActions
+          details={details}
+          step={step}
+          branchId={branchId}
+          busy={busy}
+          act={act}
+          fromMessageId={selectable ? fromId : undefined}
+        />
       )}
     </article>
+  )
+}
+
+type MessageRow = {
+  id: string
+  preview: string
+  title: string
+  status: StepMessageStatus
+}
+
+function aiConfig(step: StepDefinition, details: RunDetails): (StepDefinition & { type: 'ai' }) | null {
+  const resolved = effectiveStep(step, details.graph.steps)
+  return resolved.type === 'ai' ? resolved : null
+}
+
+function messageRows(step: StepDefinition & { type: 'ai' }, details: RunDetails, execution?: StepExecution): MessageRow[] {
+  const stored = execution?.meta.messages
+  return step.config.messages.map((message) => {
+    const body = resolveMessage(message, details.graph.sharedMessages ?? [])
+    const saved = stored?.find((item) => item.id === message.id)
+    const preview = body ? messagePreview(body.content) : isSharedRef(message) ? `Нет общего «${message.shared}»` : 'Сообщение'
+    const status = saved?.status ?? (execution?.status === 'completed' && !stored ? 'completed' : 'pending')
+    const title = [body?.content.trim() || preview, saved?.error].filter(Boolean).join('\n')
+    return { id: message.id, preview, title, status }
+  })
+}
+
+function defaultFromId(rows: MessageRow[], stepFailed: boolean, picked: string | null): string {
+  if (picked && rows.some((row) => row.id === picked)) return picked
+  const failed = rows.find((row) => row.status === 'failed')
+  if (failed) return failed.id
+  if (stepFailed) {
+    const done = [...rows].reverse().find((row) => row.status === 'completed')
+    if (done) return done.id
+  }
+  return rows[0]?.id ?? ''
+}
+
+function StepMessages({
+  rows,
+  selectable,
+  fromId,
+  onPick
+}: {
+  rows: MessageRow[]
+  selectable: boolean
+  fromId: string
+  onPick: (id: string) => void
+}) {
+  if (!rows.length) return null
+  return (
+    <div className="run-msgs">
+      {rows.map((row, index) => {
+        const className = `run-msg status-${row.status}${selectable && row.id === fromId ? ' on' : ''}`
+        const body = (
+          <>
+            <span className="run-msg-n">{index + 1}</span>
+            <span className="run-msg-text">{row.preview}</span>
+            {row.status === 'running' && <span className="run-msg-spin" aria-label="Ждём ответ" />}
+          </>
+        )
+        if (!selectable) {
+          return (
+            <div key={row.id} className={className} title={row.title}>
+              {body}
+            </div>
+          )
+        }
+        return (
+          <button key={row.id} className={className} type="button" title={row.title} onClick={() => onPick(row.id)}>
+            {body}
+          </button>
+        )
+      })}
+      {selectable && <p className="field-note">Повтор начнётся с выбранного сообщения. Более ранние в чат заново не уйдут.</p>}
+    </div>
   )
 }
 
@@ -636,13 +814,15 @@ function RunActions({
   step,
   branchId,
   busy,
-  act
+  act,
+  fromMessageId
 }: {
   details: RunDetails
   step: StepDefinition
   branchId: string
   busy: boolean
   act: (work: () => Promise<RunDetails>) => Promise<void>
+  fromMessageId?: string
 }) {
   const [appendBatch, setAppendBatch] = useState(false)
   const [answerOpen, setAnswerOpen] = useState(false)
@@ -656,13 +836,10 @@ function RunActions({
   const forcedAppend = details.graph.steps.some((item) => item.iterate?.appendOnRerun && chain.has(item.id))
   const canPasteAnswer = step.type !== 'fanout' && step.type !== 'input'
   const runAgain = (mode: 'only' | 'chain') =>
-    window.pipeline.runStep(
-      details.run.id,
-      step.id,
-      branchId,
-      mode,
-      appendBatch || forcedAppend ? { appendBatch: true } : undefined
-    )
+    window.pipeline.runStep(details.run.id, step.id, branchId, mode, {
+      ...(appendBatch || forcedAppend ? { appendBatch: true } : {}),
+      ...(fromMessageId ? { fromMessageId } : {})
+    })
   const saveAnswer = (continueAfter: boolean) => {
     if (typeof window.pipeline.acceptManualAnswer !== 'function') {
       return Promise.reject(new Error('Закройте приложение полностью и запустите снова. Обновление окна эту кнопку не подключает.'))
