@@ -1,20 +1,32 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ProviderStatus } from '@core/types'
 import { ProjectPage } from './pages/ProjectPage'
 import { ProjectsPage } from './pages/ProjectsPage'
 import { RunPage } from './pages/RunPage'
 import { WorkflowPage } from './pages/WorkflowPage'
+import type { Route } from './route'
+import {
+  closeBrowserTab,
+  createBrowserTabs,
+  jumpBrowserTab,
+  moveBrowserTab,
+  nextTabId,
+  openBrowserTab,
+  replaceBrowserRoute,
+  selectBrowserTab,
+  type BrowserTabs
+} from './tab-state'
+import { TabBar, TabProviders, TabTitleReset } from './tabs'
 import { VariableEditor } from './variables'
 import { errorText, installPlainPaste, Modal } from './ui'
 
-export type Route =
-  | { name: 'projects' }
-  | { name: 'project'; projectId: string }
-  | { name: 'workflow'; projectId: string; workflowId: string; version?: number }
-  | { name: 'run'; projectId: string; runId: string }
+export type { Route }
 
 export function App() {
-  const [route, setRoute] = useState<Route>({ name: 'projects' })
+  const [browser, setBrowser] = useState<BrowserTabs<Route>>(() => createBrowserTabs({ name: 'projects' }, nextTabId()))
+  const [titles, setTitles] = useState<Record<string, string>>({})
+  const browserRef = useRef(browser)
+  browserRef.current = browser
   const [settings, setSettings] = useState(false)
   const [quitAsk, setQuitAsk] = useState(false)
   const [importAsk, setImportAsk] = useState(false)
@@ -37,7 +49,8 @@ export function App() {
       const result = await window.pipeline.importData()
       if (result.canceled) return
       setEpoch((value) => value + 1)
-      setRoute({ name: 'projects' })
+      setTitles({})
+      setBrowser(createBrowserTabs({ name: 'projects' }, nextTabId()))
       setToast(`Импортировано: ${result.projects} проектов, ${result.workflows} workflow, ${result.runs} запусков`)
     } catch (reason) {
       setToast(errorText(reason))
@@ -67,6 +80,67 @@ export function App() {
 
   useEffect(() => installPlainPaste(), [])
 
+  const setTabTitle = useCallback((id: string, title: string) => {
+    setTitles((prev) => (prev[id] === title ? prev : { ...prev, [id]: title }))
+  }, [])
+
+  const openTab = useCallback((route: Route) => {
+    setBrowser((state) => openBrowserTab(state, route, nextTabId()))
+  }, [])
+
+  function closeTab(id: string) {
+    const current = browserRef.current
+    if (current.tabs.length <= 1 || !current.tabs.some((tab) => tab.id === id)) return
+    setBrowser((state) => closeBrowserTab(state, id))
+    setTitles((prev) => {
+      if (!(id in prev)) return prev
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
+  }
+
+  function go(id: string, route: Route) {
+    setBrowser((state) => replaceBrowserRoute(state, id, route))
+  }
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey) return
+      const key = event.key.toLowerCase()
+      if (key === 't' && !event.shiftKey) {
+        event.preventDefault()
+        setBrowser((state) => openBrowserTab(state, { name: 'projects' }, nextTabId()))
+        return
+      }
+      if (key === 'w' && !event.shiftKey) {
+        event.preventDefault()
+        const current = browserRef.current
+        if (current.tabs.length <= 1) return
+        const id = current.activeId
+        setBrowser((state) => closeBrowserTab(state, id))
+        setTitles((prev) => {
+          if (!(id in prev)) return prev
+          const next = { ...prev }
+          delete next[id]
+          return next
+        })
+        return
+      }
+      if (event.key === 'Tab') {
+        event.preventDefault()
+        setBrowser((state) => moveBrowserTab(state, event.shiftKey ? -1 : 1))
+        return
+      }
+      if (/^[1-9]$/.test(event.key)) {
+        event.preventDefault()
+        setBrowser((state) => jumpBrowserTab(state, event.key === '9' ? state.tabs.length - 1 : Number(event.key) - 1))
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
   useEffect(() => {
     if (!toast) return
     const timer = window.setTimeout(() => setToast(null), 4200)
@@ -76,7 +150,7 @@ export function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <button className="brand" type="button" onClick={() => setRoute({ name: 'projects' })}>
+        <button className="brand" type="button" onClick={() => go(browser.activeId, { name: 'projects' })}>
           <strong>Pipeline</strong>
           <span>Сборка AI-workflow</span>
         </button>
@@ -92,36 +166,27 @@ export function App() {
           </button>
         </div>
       </header>
+      <TabBar
+        tabs={browser.tabs}
+        activeId={browser.activeId}
+        titles={titles}
+        onSelect={(id) => setBrowser((state) => selectBrowserTab(state, id))}
+        onClose={closeTab}
+        onNew={() => openTab({ name: 'projects' })}
+      />
       <main className="stage" key={epoch}>
-        {route.name === 'projects' && <ProjectsPage onOpen={(projectId) => setRoute({ name: 'project', projectId })} />}
-        {route.name === 'project' && (
-          <ProjectPage
-            projectId={route.projectId}
-            onBack={() => setRoute({ name: 'projects' })}
-            onOpenWorkflow={(workflowId) => setRoute({ name: 'workflow', projectId: route.projectId, workflowId })}
-            onOpenRun={(runId) => setRoute({ name: 'run', projectId: route.projectId, runId })}
-          />
-        )}
-        {route.name === 'workflow' && (
-          <WorkflowPage
-            projectId={route.projectId}
-            workflowId={route.workflowId}
-            version={route.version}
-            onBack={() => setRoute({ name: 'project', projectId: route.projectId })}
-            onVersion={(version) => setRoute({ ...route, version })}
-            onOpenRun={(runId) => setRoute({ name: 'run', projectId: route.projectId, runId })}
+        {browser.tabs.map((tab) => (
+          <TabPane
+            key={tab.id}
+            id={tab.id}
+            route={tab.route}
+            active={tab.id === browser.activeId}
+            onRoute={(route) => go(tab.id, route)}
+            onTitle={setTabTitle}
+            onOpen={openTab}
             notify={setToast}
           />
-        )}
-        {route.name === 'run' && (
-          <RunPage
-            runId={route.runId}
-            onBack={() => setRoute({ name: 'project', projectId: route.projectId })}
-            onOpenWorkflow={(workflowId, version) => setRoute({ name: 'workflow', projectId: route.projectId, workflowId, version })}
-            onOpenRun={(nextRunId) => setRoute({ name: 'run', projectId: route.projectId, runId: nextRunId })}
-            notify={setToast}
-          />
-        )}
+        ))}
       </main>
       {toast && <div className="toast">{toast}</div>}
       {settings && <Settings onClose={() => setSettings(false)} />}
@@ -155,6 +220,78 @@ export function App() {
         </Modal>
       )}
     </div>
+  )
+}
+
+function TabPane({
+  id,
+  route,
+  active,
+  onRoute,
+  onTitle,
+  onOpen,
+  notify
+}: {
+  id: string
+  route: Route
+  active: boolean
+  onRoute: (route: Route) => void
+  onTitle: (id: string, title: string) => void
+  onOpen: (route: Route) => void
+  notify: (message: string) => void
+}) {
+  const report = useCallback((title: string) => onTitle(id, title), [id, onTitle])
+  return (
+    <div className="tab-pane" hidden={!active} role="tabpanel" id={`panel-${id}`} aria-labelledby={`tab-${id}`}>
+      <TabProviders active={active} onTitle={report} onOpen={onOpen}>
+        <TabTitleReset route={route} onTitle={report} />
+        <RouteView route={route} onRoute={onRoute} notify={notify} />
+      </TabProviders>
+    </div>
+  )
+}
+
+function RouteView({
+  route,
+  onRoute,
+  notify
+}: {
+  route: Route
+  onRoute: (route: Route) => void
+  notify: (message: string) => void
+}) {
+  return (
+    <>
+      {route.name === 'projects' && <ProjectsPage onOpen={(projectId) => onRoute({ name: 'project', projectId })} />}
+      {route.name === 'project' && (
+        <ProjectPage
+          projectId={route.projectId}
+          onBack={() => onRoute({ name: 'projects' })}
+          onOpenWorkflow={(workflowId) => onRoute({ name: 'workflow', projectId: route.projectId, workflowId })}
+          onOpenRun={(runId) => onRoute({ name: 'run', projectId: route.projectId, runId })}
+        />
+      )}
+      {route.name === 'workflow' && (
+        <WorkflowPage
+          projectId={route.projectId}
+          workflowId={route.workflowId}
+          version={route.version}
+          onBack={() => onRoute({ name: 'project', projectId: route.projectId })}
+          onVersion={(version) => onRoute({ ...route, version })}
+          onOpenRun={(runId) => onRoute({ name: 'run', projectId: route.projectId, runId })}
+          notify={notify}
+        />
+      )}
+      {route.name === 'run' && (
+        <RunPage
+          runId={route.runId}
+          onBack={() => onRoute({ name: 'project', projectId: route.projectId })}
+          onOpenWorkflow={(workflowId, version) => onRoute({ name: 'workflow', projectId: route.projectId, workflowId, version })}
+          onOpenRun={(nextRunId) => onRoute({ name: 'run', projectId: route.projectId, runId: nextRunId })}
+          notify={notify}
+        />
+      )}
+    </>
   )
 }
 

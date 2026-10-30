@@ -1,7 +1,7 @@
-import { fanoutInnerSteps, hiddenDescendantIds, topoSort } from '@core/graph'
+import { branchStepIds, fanoutInnerSteps, hiddenDescendantIds, topoSort } from '@core/graph'
 import { EXEC_STATUS_LABEL, STEP_TYPE_LABEL } from '@core/labels'
 import { sideChains, type SideChain } from '@core/side-branch'
-import type { RunDetails, StepDefinition, StepExecution } from '@core/types'
+import type { Branch, RunDetails, StepDefinition, StepExecution } from '@core/types'
 
 const GAP_X = 36
 const GAP_Y = 32
@@ -321,11 +321,30 @@ function splitStatus(details: RunDetails, stepId: string, parentBranchId: string
     const error = latestExecution(details.executions, stepId, parentBranchId)
     return error?.status === 'failed' ? 'failed' : 'pending'
   }
-  if (branches.every((branch) => branch.status === 'completed')) return 'completed'
-  if (branches.some((branch) => branch.status === 'failed')) return 'failed'
-  if (branches.some((branch) => branch.status === 'running')) return 'running'
-  if (branches.some((branch) => branch.status === 'waiting_for_user')) return 'waiting_for_user'
+  const statuses = branches.map((branch) => branchViewStatus(details, branch))
+  if (statuses.every((status) => status === 'completed')) return 'completed'
+  if (statuses.some((status) => status === 'failed')) return 'failed'
+  if (statuses.some((status) => status === 'running')) return 'running'
+  if (statuses.some((status) => status === 'waiting_for_user')) return 'waiting_for_user'
   return 'paused'
+}
+
+/** Статус элемента без шагов, которые попали в ветку по ошибке и к ней не относятся. */
+export function branchViewStatus(details: RunDetails, branch: Branch): Branch['status'] {
+  const allowed = branchStepIds(branch.sourceStepId, details.graph.steps)
+  const latest = new Map<string, StepExecution>()
+  for (const execution of details.executions) {
+    if (execution.branchId !== branch.id || !allowed.has(execution.stepId)) continue
+    const prev = latest.get(execution.stepId)
+    if (!prev || execution.attempt > prev.attempt) latest.set(execution.stepId, execution)
+  }
+  const values = [...latest.values()]
+  if (values.some((item) => item.status === 'waiting_for_user')) return 'waiting_for_user'
+  if (values.some((item) => item.status === 'running')) return 'running'
+  if (values.some((item) => item.status === 'failed' && !item.meta.interrupted)) return 'failed'
+  const stuck = branch.status === 'waiting_for_user' || branch.status === 'failed' || branch.status === 'running'
+  if (stuck && values.length && values.every((item) => item.status === 'completed' || item.status === 'skipped')) return 'completed'
+  return branch.status
 }
 
 function latestExecution(executions: StepExecution[], stepId: string, branchId: string): StepExecution | undefined {
@@ -339,6 +358,7 @@ export function stepExecution(details: RunDetails, stepId: string, branchId: str
   const ownedBy = new Map<string, boolean>()
   const misplaced = details.executions.filter((item) => {
     if (item.stepId !== stepId || !children.has(item.branchId) || item.meta.fanoutError) return false
+    if (item.status === 'waiting_for_user' || item.status === 'pending') return false
     const sourceId = details.branches.find((branch) => branch.id === item.branchId)?.sourceStepId
     if (!sourceId) return false
     let owned = ownedBy.get(sourceId)

@@ -50,7 +50,7 @@ export type PipelineApi = {
   getRun: (runId: string) => Promise<RunDetails>
   updateRunInputs: (runId: string, inputs: Record<string, unknown>) => Promise<RunDetails>
   updateRunTitle: (runId: string, title: string) => Promise<RunDetails>
-  setRunVersion: (runId: string, versionNumber: number) => Promise<RunDetails>
+  setRunVersion: (runId: string, versionNumber: number, force?: boolean) => Promise<RunDetails>
   startRun: (runId: string, options?: { untilStepId?: string }) => Promise<RunDetails>
   continueRun: (
     runId: string,

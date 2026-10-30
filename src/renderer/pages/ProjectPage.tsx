@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { Project, RunSummary, Workflow } from '@core/types'
 import { RUN_STATUS_LABEL } from '@core/labels'
+import { navHandlers, useOpenTab, useTabTitle } from '../tabs'
 import { errorText, Modal, StatusPill, whenText } from '../ui'
 import { VariableEditor } from '../variables'
 
@@ -22,6 +23,8 @@ export function ProjectPage({
   const [error, setError] = useState<string | null>(null)
   const [menuRunId, setMenuRunId] = useState<string | null>(null)
   const [pendingDelete, setPendingDelete] = useState<RunSummary | null>(null)
+  const openTab = useOpenTab()
+  useTabTitle(project?.name ?? '')
 
   async function reload() {
     const [projects, nextWorkflows, nextRuns] = await Promise.all([
@@ -111,7 +114,15 @@ export function ProjectPage({
       </div>
       <div className="grid">
         {workflows.map((workflow) => (
-          <button key={workflow.id} className="card" type="button" onClick={() => onOpenWorkflow(workflow.id)}>
+          <button
+            key={workflow.id}
+            className="card"
+            type="button"
+            {...navHandlers(
+              () => onOpenWorkflow(workflow.id),
+              () => openTab({ name: 'workflow', projectId, workflowId: workflow.id })
+            )}
+          >
             <strong>{workflow.name}</strong>
             <span className="meta">{workflow.description || 'Без описания'}</span>
             <span className="meta">Версия {workflow.latestVersion}</span>
@@ -122,7 +133,14 @@ export function ProjectPage({
       <div className="grid">
         {runs.map((run) => (
           <article key={run.id} className="card run-card">
-            <button className="run-main" type="button" onClick={() => onOpenRun(run.id)}>
+            <button
+              className="run-main"
+              type="button"
+              {...navHandlers(
+                () => onOpenRun(run.id),
+                () => openTab({ name: 'run', projectId, runId: run.id })
+              )}
+            >
               <strong>{run.title}</strong>
               <span className="meta">
                 {run.workflowName} · v{run.versionNumber}

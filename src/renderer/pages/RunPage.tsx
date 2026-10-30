@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { chainStepIds } from '@core/graph'
-import { stepExecution } from '@core/run-layout'
+import { branchViewStatus, stepExecution } from '@core/run-layout'
 import { messagePreview, isSharedRef, resolveMessage } from '@core/shared-messages'
 import { pretty } from '@core/labels'
 import { storedFiles } from '@core/media'
@@ -9,6 +9,7 @@ import { effectiveStep } from '@core/step-ref'
 import type { RunDetails, StepDefinition, StepExecution, StepMessageStatus, StoredFile, UserActionPayload } from '@core/types'
 import { MediaPicker, attachmentsFromTransfer, type MediaAccept } from '../media-field'
 import { RunCanvas, type CanvasNode } from '../run-canvas'
+import { navHandlers, useOpenTab, useTabTitle } from '../tabs'
 import { clipboardHasFiles, copyText, errorText, JsonView, Modal, StatusPill, whenText } from '../ui'
 
 export function RunPage({
@@ -33,6 +34,8 @@ export function RunPage({
   const [versions, setVersions] = useState<number[]>([])
   const [versionChoice, setVersionChoice] = useState<{ version: number; fit: RunVersionFit } | null>(null)
   const [resetOpen, setResetOpen] = useState(false)
+  const openTab = useOpenTab()
+  useTabTitle(title)
 
   async function reload() {
     const next = await window.pipeline.getRun(runId)
@@ -48,11 +51,11 @@ export function RunPage({
     setVersionChoice({ version, fit: runVersionFit(details.graph, workflow.version.graph, details) })
   }
 
-  function applyVersion(version: number) {
+  function applyVersion(version: number, force = false) {
     setVersionChoice(null)
     void act(async () => {
-      const next = await window.pipeline.setRunVersion(runId, version)
-      notify(`Схема запуска: v${version}`)
+      const next = await window.pipeline.setRunVersion(runId, version, force)
+      notify(force ? `Схема запуска принудительно переведена на v${version}` : `Схема запуска: v${version}`)
       return next
     })
   }
@@ -109,7 +112,14 @@ export function RunPage({
             }}
           />
           <p className="lede">
-            <button className="ghost" type="button" onClick={() => onOpenWorkflow(run.workflowId, details.versionNumber)}>
+            <button
+              className="ghost"
+              type="button"
+              {...navHandlers(
+                () => onOpenWorkflow(run.workflowId, details.versionNumber),
+                () => openTab({ name: 'workflow', projectId: run.projectId, workflowId: run.workflowId, version: details.versionNumber })
+              )}
+            >
               {details.workflowName}
             </button>
             {typeof window.pipeline.setRunVersion === 'function' && versions.length > 0 && (
@@ -233,15 +243,23 @@ export function RunPage({
             </>
           ) : (
             <>
-              <p className="lede">Эта версия меняет уже выполненные шаги так, что старые результаты нельзя продолжить.</p>
+              <p className="lede">Эта версия меняет уже выполненные шаги так, что старые результаты с ней не стыкуются.</p>
               {versionChoice.fit.reasons.map((reason) => (
                 <p key={reason} className="meta">
                   {reason}
                 </p>
               ))}
-              <button className="btn" type="button" onClick={() => setVersionChoice(null)}>
-                Понятно
-              </button>
+              <p className="lede">
+                Можно перейти всё равно. Уже выполненные шаги останутся, а следующее продолжение пойдёт по v{versionChoice.version}. Если схема с ними не сойдётся, запуск может сломаться. Это на вашей ответственности.
+              </p>
+              <div className="row">
+                <button className="danger" type="button" disabled={busy} onClick={() => applyVersion(versionChoice.version, true)}>
+                  Всё равно перейти
+                </button>
+                <button className="ghost" type="button" onClick={() => setVersionChoice(null)}>
+                  Отмена
+                </button>
+              </div>
             </>
           )}
         </Modal>
@@ -548,7 +566,7 @@ function CanvasDock({
           <div className="row">
             <span className="branch-num">{branch.itemIndex + 1}</span>
             <strong>{branch.label}</strong>
-            <StatusPill status={branch.status} />
+            <StatusPill status={branchViewStatus(details, branch)} />
           </div>
           <pre className="branch-item">{pretty(branch.item)}</pre>
           {noteAlias && branch.status === 'pending' && (

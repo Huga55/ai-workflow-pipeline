@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Branch, RunDetails } from '@core/types'
 import { layoutRun, type CanvasNode } from '@core/run-layout'
+import { useTabActive } from './tabs'
 import { StatusPill } from './ui'
 
 export type { CanvasNode }
@@ -19,11 +20,13 @@ export function RunCanvas({
   const fit = useRef({ x: 28, y: 28, scale: 1 })
   const [view, setView] = useState(fit.current)
   const drag = useRef<{ px: number; py: number; x: number; y: number } | null>(null)
+  const active = useTabActive()
   const layout = layoutRun(details)
   const worldW = Math.max(640, layout.width + 64)
   const worldH = Math.max(420, layout.height + 64)
 
   useEffect(() => {
+    if (!active) return
     const stage = stageRef.current
     if (!stage) return
     const rect = stage.getBoundingClientRect()
@@ -36,7 +39,7 @@ export function RunCanvas({
     const next = { x: 28, y: 28, scale }
     fit.current = next
     setView(next)
-  }, [details.run.id, details.branches.length, layout.nodes.length, layout.width, layout.height])
+  }, [active, details.run.id, details.branches.length, layout.nodes.length, layout.width, layout.height])
 
   useEffect(() => {
     const stage = stageRef.current

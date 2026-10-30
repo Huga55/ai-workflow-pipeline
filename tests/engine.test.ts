@@ -1836,6 +1836,408 @@ describe('engine', () => {
     expect(store.executions.some((item) => item.stepId === 'extra_ai' && shots.some((branch) => branch.id === item.branchId))).toBe(false)
   })
 
+  it('does not start the main look after a side branch answer or a rerun from that branch', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'concept', launch: 'manual' },
+        config: {}
+      }),
+      step({
+        id: 'extra',
+        key: 'extra',
+        name: 'Дополнительные шоты',
+        type: 'manual',
+        order: 3,
+        dependsOn: ['items'],
+        sideBranch: true,
+        config: { mode: 'text', prompt: 'Какие ещё кадры?', allowEmpty: false }
+      }),
+      step({
+        id: 'extra_ai',
+        key: 'extra_ai',
+        name: 'Формирование дополнительных шотов',
+        type: 'transform',
+        order: 4,
+        dependsOn: ['extra'],
+        config: { mode: 'template', template: 'later' }
+      }),
+      step({
+        id: 'look',
+        key: 'look',
+        name: 'Формирование лука',
+        type: 'transform',
+        order: 5,
+        dependsOn: ['items'],
+        config: { mode: 'template', template: 'look' }
+      })
+    ]
+    const options = { runId: 'run', graph: graph(steps), inputs: {} }
+    expect(await engine.advance(options)).toBe('paused')
+    const concept = store.branches.find((branch) => branch.sourceStepId === 'items')
+    expect(await engine.advance({ ...options, onlyBranchId: concept?.id })).toBe('paused')
+    const lookRuns = () => store.executions.filter((item) => item.stepId === 'look' && item.branchId === concept?.id)
+    expect(lookRuns().map((item) => item.status)).toEqual(['completed'])
+    store.executions = store.executions.filter((item) => item.stepId !== 'look')
+    const waiting = store.executions.find((item) => item.stepId === 'extra' && item.status === 'waiting_for_user')
+    expect(await engine.submitUserAction(options, waiting?.id ?? '', { type: 'text', text: 'боковой' })).toBe('completed')
+    expect(store.executions.some((item) => item.stepId === 'extra_ai' && item.status === 'completed' && item.branchId === concept?.id)).toBe(true)
+    expect(lookRuns()).toHaveLength(0)
+
+    expect(await engine.advance({ ...options, focus: { stepId: 'extra', branchId: concept?.id ?? '', mode: 'chain' } })).toBe('paused')
+    expect(lookRuns()).toHaveLength(0)
+  })
+
+  it('keeps the main chain outside a side fanout that only splits an earlier answer', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'ask',
+        key: 'ask',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return "recommendations";' }
+      }),
+      step({
+        id: 'parsed',
+        key: 'parsed',
+        name: 'Разбор рекомендованных моделей',
+        type: 'transform',
+        order: 2,
+        dependsOn: ['ask'],
+        sideBranch: true,
+        config: { mode: 'script', script: 'return ["Contemporary", "Minimalist"];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 3,
+        dependsOn: ['parsed'],
+        iterate: { over: '{{steps.parsed.output}}', alias: 'model', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'notes',
+        key: 'notes',
+        name: 'Дополнительные замечания по одежде',
+        type: 'manual',
+        order: 4,
+        dependsOn: ['ask'],
+        config: { mode: 'text', prompt: 'Замечания', allowEmpty: true }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('paused')
+    const models = store.branches.filter((branch) => branch.sourceStepId === 'items')
+    expect(models).toHaveLength(2)
+    expect(models.every((branch) => branch.status === 'completed')).toBe(true)
+    const notes = store.executions.filter((item) => item.stepId === 'notes')
+    expect(notes).toHaveLength(1)
+    expect(notes[0].branchId).toBe('')
+    expect(notes[0].status).toBe('waiting_for_user')
+  })
+
+  it('starts the garment specification once on the run when model branches already exist', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'ask',
+        key: 'ask',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return "recommendations";' }
+      }),
+      step({
+        id: 'parsed',
+        key: 'parsed',
+        name: 'Разбор рекомендованных моделей',
+        type: 'transform',
+        order: 2,
+        dependsOn: ['ask'],
+        sideBranch: true,
+        config: { mode: 'script', script: 'return ["Contemporary", "Minimalist"];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 3,
+        dependsOn: ['parsed'],
+        iterate: { over: '{{steps.parsed.output}}', alias: 'model', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'notes',
+        key: 'notes',
+        type: 'manual',
+        order: 4,
+        dependsOn: ['ask'],
+        config: { mode: 'text', prompt: 'Замечания', allowEmpty: true }
+      }),
+      step({
+        id: 'spec',
+        key: 'spec',
+        name: 'AI спецификация одежды',
+        type: 'transform',
+        order: 5,
+        dependsOn: ['notes'],
+        config: { mode: 'template', template: 'spec' }
+      })
+    ]
+    const options = { runId: 'run', graph: graph(steps), inputs: {} }
+    expect(await engine.advance(options)).toBe('paused')
+    const models = store.branches.filter((branch) => branch.sourceStepId === 'items')
+    expect(models).toHaveLength(2)
+    for (const branch of models) {
+      store.insertExecution({
+        id: `old-${branch.id}`,
+        runId: 'run',
+        stepId: 'spec',
+        branchId: branch.id,
+        attempt: 1,
+        status: 'failed',
+        request: null,
+        rawResponse: null,
+        parsed: null,
+        error: 'Остановлено',
+        startedAt: '2026-10-28T20:12:19.000Z',
+        finishedAt: '2026-10-28T20:12:20.000Z',
+        durationMs: 1,
+        meta: { interrupted: true, messages: [{ id: 'm1', status: 'completed' }] },
+        createdAt: '2026-10-28T20:12:19.000Z'
+      })
+    }
+    expect(await engine.advance({ ...options, focus: { stepId: 'spec', branchId: '', mode: 'chain' } })).toBe('completed')
+    const spec = store.executions.filter((item) => item.stepId === 'spec')
+    const onRun = spec.filter((item) => item.branchId === '' && item.status === 'completed')
+    const onModels = spec.filter((item) => item.branchId !== '')
+    expect(onRun).toHaveLength(1)
+    expect(onModels).toHaveLength(models.length)
+    expect(onModels.every((item) => item.attempt === 1)).toBe(true)
+  })
+
+  it('runs the look chain on the concept while an earlier side fanout is still waiting', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'concept', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'extra',
+        key: 'extra',
+        name: 'Дополнительные шоты',
+        type: 'manual',
+        order: 3,
+        dependsOn: ['items'],
+        sideBranch: true,
+        config: { mode: 'text', prompt: 'Какие ещё кадры?', allowEmpty: true }
+      }),
+      step({
+        id: 'extra_list',
+        key: 'extra_list',
+        type: 'transform',
+        order: 4,
+        dependsOn: ['extra'],
+        config: { mode: 'template', template: '["shot"]' }
+      }),
+      step({
+        id: 'extra_items',
+        key: 'extra_items',
+        type: 'fanout',
+        order: 5,
+        dependsOn: ['extra_list'],
+        iterate: { over: '{{steps.extra_list.output}}', alias: 'shot', launch: 'sequence' },
+        config: {}
+      }),
+      step({
+        id: 'look',
+        key: 'look',
+        name: 'Формирование лука',
+        type: 'transform',
+        order: 6,
+        dependsOn: ['items'],
+        config: { mode: 'template', template: 'look' }
+      }),
+      step({
+        id: 'look_note',
+        key: 'look_note',
+        name: 'Разбор вариантов лука',
+        type: 'transform',
+        order: 7,
+        dependsOn: ['look'],
+        sideBranch: true,
+        config: { mode: 'template', template: 'variants' }
+      })
+    ]
+    expect(await run(engine, store, steps)).toBe('paused')
+    const concept = store.branches.find((branch) => branch.sourceStepId === 'items')
+    expect(concept).toBeTruthy()
+    const onConcept = (stepId: string) =>
+      store.executions.find((item) => item.stepId === stepId && item.branchId === concept?.id)
+    expect(onConcept('extra')?.status).toBe('waiting_for_user')
+    expect(onConcept('look')?.status).toBe('completed')
+    expect(onConcept('look_note')?.status).toBe('completed')
+    expect(store.branches.some((branch) => branch.sourceStepId === 'extra_items')).toBe(false)
+  })
+
+  it('runs extra shot elements from a side branch and leaves the main shots alone', async () => {
+    const store = new MemoryStore()
+    const engine = new WorkflowEngine(store)
+    const steps = [
+      step({
+        id: 'concepts',
+        key: 'concepts',
+        type: 'transform',
+        order: 1,
+        config: { mode: 'script', script: 'return [{ title: "A" }];' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        type: 'fanout',
+        order: 2,
+        dependsOn: ['concepts'],
+        iterate: { over: '{{steps.concepts.output}}', alias: 'concept', launch: 'manual' },
+        config: {}
+      }),
+      step({
+        id: 'config',
+        key: 'config',
+        type: 'transform',
+        order: 3,
+        dependsOn: ['items'],
+        config: { mode: 'template', template: 'cfg' }
+      }),
+      step({
+        id: 'extra',
+        key: 'extra',
+        name: 'Описание дополнительных шотов',
+        type: 'manual',
+        order: 4,
+        dependsOn: ['config'],
+        sideBranch: true,
+        config: { mode: 'text', prompt: 'Какие ещё кадры?', allowEmpty: true }
+      }),
+      step({
+        id: 'extra_ai',
+        key: 'extra_ai',
+        name: 'Формирование дополнительных шотов',
+        type: 'transform',
+        order: 5,
+        dependsOn: ['extra'],
+        config: { mode: 'script', script: 'return { shots: [{ title: "E1" }] };' }
+      }),
+      step({
+        id: 'extra_parse',
+        key: 'extra_parse',
+        name: 'Разбор дополнительных шотов',
+        type: 'transform',
+        order: 6,
+        dependsOn: ['extra_ai'],
+        config: { mode: 'extract', source: '{{steps.extra_ai.output}}' }
+      }),
+      step({
+        id: 'extra_items',
+        key: 'extra_items',
+        name: 'Элементы дополнительного шота',
+        type: 'fanout',
+        order: 7,
+        dependsOn: ['extra_parse'],
+        iterate: { over: '{{steps.extra_parse.output.shots}}', alias: 'item', launch: 'manual' },
+        config: {}
+      }),
+      step({
+        id: 'extra_json',
+        key: 'extra_json',
+        name: 'JSON доп шота',
+        type: 'transform',
+        order: 8,
+        dependsOn: ['extra_items'],
+        config: { mode: 'template', template: 'extra' }
+      }),
+      step({
+        id: 'shot_parse',
+        key: 'shot_parse',
+        name: 'Разбор шотов',
+        type: 'transform',
+        order: 9,
+        dependsOn: ['config'],
+        config: { mode: 'script', script: 'return { shots: [{ title: "S1" }] };' }
+      }),
+      step({
+        id: 'shot_items',
+        key: 'shot_items',
+        name: 'Элемент шота',
+        type: 'fanout',
+        order: 10,
+        dependsOn: ['shot_parse'],
+        iterate: { over: '{{steps.shot_parse.output.shots}}', alias: 'item', launch: 'sequence' },
+        config: {}
+      }),
+      step({
+        id: 'shot_json',
+        key: 'shot_json',
+        name: 'JSON шота',
+        type: 'transform',
+        order: 11,
+        dependsOn: ['shot_items'],
+        config: { mode: 'template', template: 'shot' }
+      })
+    ]
+    const options = { runId: 'run', graph: graph(steps), inputs: {} }
+    expect(await engine.advance({ ...options, startManualBranches: true })).toBe('paused')
+    const concept = store.branches.find((branch) => branch.sourceStepId === 'items')
+    const shotRuns = () => store.executions.filter((item) => item.stepId === 'shot_json' && item.status === 'completed')
+    const shotParseRuns = () => store.executions.filter((item) => item.stepId === 'shot_parse')
+    expect(shotRuns()).toHaveLength(1)
+    expect(shotParseRuns()).toHaveLength(1)
+    const waiting = store.executions.find((item) => item.stepId === 'extra' && item.status === 'waiting_for_user')
+    const followed = await engine.submitUserAction(options, waiting?.id ?? '', { type: 'text', text: 'боковой' })
+    expect(followed === 'paused' || followed === 'completed').toBe(true)
+    const extra = store.branches.filter((branch) => branch.sourceStepId === 'extra_items')
+    expect(extra).toHaveLength(1)
+    expect(extra[0]?.status).toBe('completed')
+    expect(store.executions.some((item) => item.stepId === 'extra_json' && item.status === 'completed' && item.branchId === extra[0]?.id)).toBe(true)
+    expect(shotRuns()).toHaveLength(1)
+    expect(shotParseRuns()).toHaveLength(1)
+
+    const before = store.executions.length
+    const again = await engine.advance({ ...options, focus: { stepId: 'extra_parse', branchId: concept?.id ?? '', mode: 'chain' } })
+    expect(again === 'paused' || again === 'completed').toBe(true)
+    const added = store.executions.slice(before)
+    expect(added.some((item) => item.stepId === 'shot_parse' || item.stepId === 'shot_json' || item.stepId === 'shot_items')).toBe(false)
+    expect(added.some((item) => item.stepId === 'extra_json')).toBe(true)
+  })
+
   it('creates every nested branch when continuing one outer branch and when rerunning the chain', async () => {
     const store = new MemoryStore()
     const engine = new WorkflowEngine(store)

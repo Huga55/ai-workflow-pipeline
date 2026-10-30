@@ -51,7 +51,9 @@ export function registerIpc(service: AppService, getWindow: () => BrowserWindow 
   ipcMain.handle('getRun', (_event, runId: string) => service.getRun(runId))
   ipcMain.handle('updateRunInputs', (_event, runId: string, inputs: Record<string, unknown>) => service.updateRunInputs(runId, inputs))
   ipcMain.handle('updateRunTitle', (_event, runId: string, title: string) => service.updateRunTitle(runId, title))
-  ipcMain.handle('setRunVersion', (_event, runId: string, versionNumber: number) => service.setRunVersion(runId, versionNumber))
+  ipcMain.handle('setRunVersion', (_event, runId: string, versionNumber: number, force?: boolean) =>
+    service.setRunVersion(runId, versionNumber, force)
+  )
   ipcMain.handle('startRun', (_event, runId: string, options?: { untilStepId?: string }) => service.startRun(runId, options))
   ipcMain.handle(
     'continueRun',

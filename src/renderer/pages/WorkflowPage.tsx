@@ -19,6 +19,7 @@ import { findMissingVariables } from '@core/missing-variables'
 import { latestVariableVersion, type VariablePools } from '@core/variables'
 import type { AIMessageBody, BranchLaunch, InputDefinition, InputType, MessageWhen, SharedMessage, StepDefinition, StepType, WorkflowChat, WorkflowDetails, WorkflowGraph, WorkflowSnippet } from '@core/types'
 import { formatWorkflowJson, parseWorkflowJson, type WorkflowJsonDocument } from '@core/workflow-json'
+import { useTabActive, useTabTitle } from '../tabs'
 import {
   copyText,
   errorText,
@@ -191,7 +192,11 @@ export function WorkflowPage({
     }
   }, [readOnly, workflowId, version])
 
+  const tabActive = useTabActive()
+  useTabTitle(name)
+
   useEffect(() => {
+    if (!tabActive) return
     const onKey = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key === 's') {
         event.preventDefault()

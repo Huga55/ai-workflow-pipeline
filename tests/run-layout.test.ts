@@ -15,7 +15,9 @@ function step(partial: Partial<StepDefinition> & Pick<StepDefinition, 'id' | 'ke
   }
 }
 
-function branch(partial: Pick<Branch, 'id' | 'parentBranchId' | 'sourceStepId' | 'itemIndex' | 'label'> & { batch?: number }): Branch {
+function branch(
+  partial: Pick<Branch, 'id' | 'parentBranchId' | 'sourceStepId' | 'itemIndex' | 'label'> & { batch?: number; status?: Branch['status'] }
+): Branch {
   return {
     runId: 'run',
     alias: 'item',
@@ -25,6 +27,26 @@ function branch(partial: Pick<Branch, 'id' | 'parentBranchId' | 'sourceStepId' |
     status: 'pending',
     ...partial,
     batch: partial.batch ?? 0
+  }
+}
+
+function execution(stepId: string, branchId: string, status: StepExecution['status']): StepExecution {
+  return {
+    id: `${stepId}:${branchId}:${status}`,
+    runId: 'run',
+    stepId,
+    branchId,
+    attempt: 1,
+    status,
+    request: null,
+    rawResponse: null,
+    parsed: null,
+    error: null,
+    startedAt: '2026-10-28T12:00:00.000Z',
+    finishedAt: status === 'waiting_for_user' ? null : '2026-10-28T12:00:01.000Z',
+    durationMs: 1,
+    meta: {},
+    createdAt: '2026-10-28T12:00:00.000Z'
   }
 }
 
@@ -508,6 +530,157 @@ describe('run layout', () => {
     assert.equal(laid.nodes.filter((node) => node.stepId === 'extra').length, 1)
     assert.ok(laid.edges.some((edge) => edge.from === concept.id && edge.to === extra.id))
     assert.ok(extra.x >= concept.x + concept.w)
+  })
+
+  it('keeps the look chain on the concept when an earlier side fanout would swallow it', () => {
+    const steps = [
+      step({
+        id: 'items',
+        key: 'items',
+        name: 'Элемент концепции',
+        type: 'fanout',
+        order: 1,
+        iterate: { over: '{{steps.prep.output}}', alias: 'concept', launch: 'manual' },
+        config: {}
+      }),
+      step({
+        id: 'extra',
+        key: 'extra',
+        name: 'Дополнительные шоты — требования',
+        type: 'manual',
+        order: 2,
+        dependsOn: ['items'],
+        sideBranch: true,
+        config: { mode: 'text', prompt: '', allowEmpty: true }
+      }),
+      step({
+        id: 'extra_list',
+        key: 'extra_list',
+        name: 'Разбор дополнительных шотов',
+        type: 'transform',
+        order: 3,
+        dependsOn: ['extra'],
+        config: { mode: 'template', template: '' }
+      }),
+      step({
+        id: 'extra_items',
+        key: 'extra_items',
+        name: 'Элементы дополнительных шотов',
+        type: 'fanout',
+        order: 4,
+        dependsOn: ['extra_list'],
+        iterate: { over: '{{steps.extra_list.output}}', alias: 'shot', launch: 'sequence' },
+        config: {}
+      }),
+      step({
+        id: 'extra_json',
+        key: 'extra_json',
+        name: 'JSON-промпт дополнительного шота',
+        type: 'transform',
+        order: 5,
+        dependsOn: ['extra_items'],
+        config: { mode: 'template', template: '' }
+      }),
+      step({
+        id: 'look',
+        key: 'look',
+        name: 'Формирование лука для концепции',
+        type: 'transform',
+        order: 6,
+        dependsOn: ['items'],
+        config: { mode: 'template', template: '' }
+      }),
+      step({
+        id: 'look_note',
+        key: 'look_note',
+        name: 'Разбор вариантов лука',
+        type: 'transform',
+        order: 7,
+        dependsOn: ['look'],
+        sideBranch: true,
+        config: { mode: 'template', template: '' }
+      })
+    ]
+    const laid = layoutRun(
+      details(steps, [branch({ id: 'c0', parentBranchId: '', sourceStepId: 'items', itemIndex: 0, label: 'Чистая элеганность' })])
+    )
+    const concept = laid.nodes.find((node) => node.role === 'item' && node.branchId === 'c0')
+    const look = laid.nodes.find((node) => node.stepId === 'look')
+    const lookNote = laid.nodes.find((node) => node.stepId === 'look_note')
+    const extra = laid.nodes.find((node) => node.stepId === 'extra')
+    assert.ok(concept && look && lookNote && extra)
+    assert.equal(laid.nodes.filter((node) => node.stepId === 'look').length, 1)
+    assert.equal(laid.nodes.filter((node) => node.stepId === 'look_note').length, 1)
+    assert.equal(look.branchId, 'c0')
+    assert.equal(lookNote.branchId, 'c0')
+    assert.equal(extra.branchId, 'c0')
+    assert.ok(look.y > concept.y)
+    assert.equal(laid.frames.filter((frame) => frame.label === 'Доп. ветка').length, 2)
+  })
+
+  it('keeps the main chain next to a side fanout instead of copying it into each item', () => {
+    const steps = [
+      step({
+        id: 'ask',
+        key: 'ask',
+        name: 'AI рекомендации по модели',
+        type: 'ai',
+        order: 1,
+        config: { provider: 'qwen', model: 'qwen', messages: [], outputFormat: 'text' }
+      }),
+      step({
+        id: 'parsed',
+        key: 'parsed',
+        name: 'Разбор рекомендованных моделей',
+        type: 'transform',
+        order: 2,
+        dependsOn: ['ask'],
+        sideBranch: true,
+        config: { mode: 'template', template: '' }
+      }),
+      step({
+        id: 'items',
+        key: 'items',
+        name: 'Элементы рекомендованной модели',
+        type: 'fanout',
+        order: 3,
+        dependsOn: ['parsed'],
+        iterate: { over: '{{steps.parsed.output}}', alias: 'model', launch: 'all' },
+        config: {}
+      }),
+      step({
+        id: 'notes',
+        key: 'notes',
+        name: 'Дополнительные замечания по одежде',
+        type: 'manual',
+        order: 4,
+        dependsOn: ['ask'],
+        config: { mode: 'text', prompt: '' }
+      })
+    ]
+    const data = details(steps, [
+      branch({ id: 'm0', parentBranchId: '', sourceStepId: 'items', itemIndex: 0, label: 'Contemporary', status: 'waiting_for_user' }),
+      branch({ id: 'm1', parentBranchId: '', sourceStepId: 'items', itemIndex: 1, label: 'Minimalist', status: 'waiting_for_user' })
+    ])
+    data.executions = [
+      execution('ask', '', 'completed'),
+      execution('parsed', '', 'completed'),
+      execution('items', 'm0', 'completed'),
+      execution('items', 'm1', 'completed'),
+      execution('notes', 'm0', 'waiting_for_user'),
+      execution('notes', 'm1', 'waiting_for_user')
+    ]
+    const laid = layoutRun(data)
+    const ask = laid.nodes.find((node) => node.stepId === 'ask')
+    const notes = laid.nodes.filter((node) => node.stepId === 'notes')
+    const split = laid.nodes.find((node) => node.role === 'split' && node.stepId === 'items')
+    const parsed = laid.nodes.find((node) => node.stepId === 'parsed')
+    assert.ok(ask && split && parsed)
+    assert.equal(notes.length, 1)
+    assert.equal(notes[0].branchId, '')
+    assert.equal(parsed.status, 'completed')
+    assert.equal(split.status, 'completed')
+    assert.ok(laid.edges.some((edge) => edge.from === ask.id && edge.to === notes[0].id))
   })
 
   it('places chat presets above the first step', () => {

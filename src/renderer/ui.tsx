@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
+import { useTabActive } from './tabs'
 import { createPortal } from 'react-dom'
 import { isStoredFile, isTextWithFiles, storedFiles, toMediaUrl } from '@core/media'
 import { pretty } from '@core/labels'
@@ -187,6 +188,7 @@ export function VariablePicker({
   const panelRef = useRef<HTMLDivElement>(null)
   const tabsRef = useRef<HTMLDivElement>(null)
   const pools = useContext(VariablePoolsContext)
+  const tabActive = useTabActive()
   const groups = variableCatalog(graph, step, pools).filter((group) => group.items.length > 0)
   const current = groups.find((group) => group.title === tab) ?? groups[0]
 
@@ -215,6 +217,10 @@ export function VariablePicker({
     if (!open) return
     reposition()
   }, [open])
+
+  useEffect(() => {
+    if (!tabActive) setOpen(false)
+  }, [tabActive])
 
   useEffect(() => {
     if (!open) return
@@ -391,7 +397,9 @@ export function Modal({
 }) {
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
+  const tabActive = useTabActive()
   useEffect(() => {
+    if (!tabActive) return
     const close = () => onCloseRef.current()
     modalClosers.push(close)
     const onKey = (event: KeyboardEvent) => {
@@ -404,7 +412,8 @@ export function Modal({
       if (index >= 0) modalClosers.splice(index, 1)
       window.removeEventListener('keydown', onKey)
     }
-  }, [])
+  }, [tabActive])
+  if (!tabActive) return null
   return createPortal(
     <div className="modal-back" style={{ zIndex: 30 + modalClosers.length }} onMouseDown={onClose}>
       <div className={`modal${wide ? ' modal-wide' : ''}`} onMouseDown={(event) => event.stopPropagation()}>
@@ -426,6 +435,11 @@ export function Hint({ text }: { text: string }) {
   const [place, setPlace] = useState({ top: 0, left: 0 })
   const buttonRef = useRef<HTMLButtonElement>(null)
   const popRef = useRef<HTMLDivElement>(null)
+  const tabActive = useTabActive()
+
+  useEffect(() => {
+    if (!tabActive) setOpen(false)
+  }, [tabActive])
 
   useEffect(() => {
     if (!open) return

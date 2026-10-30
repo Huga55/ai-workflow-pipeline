@@ -341,13 +341,13 @@ export class AppService {
     return this.database.getRun(runId)
   }
 
-  setRunVersion(runId: string, versionNumber: number): RunDetails {
+  setRunVersion(runId: string, versionNumber: number, force = false): RunDetails {
     if (this.active.has(runId)) throw new Error('Этот запуск сейчас выполняется. Сначала остановите его.')
     const details = this.database.getRun(runId)
     const version = this.database.getVersionByNumber(details.run.workflowId, versionNumber)
     if (version.id === details.run.workflowVersionId) return details
     const fit = runVersionFit(details.graph, version.graph, details)
-    if (!fit.ok) throw new Error(fit.reasons.join('\n'))
+    if (!fit.ok && !force) throw new Error(fit.reasons.join('\n'))
     this.database.updateRunWorkflowVersion(runId, version.id, normalizeInputs(version.graph, details.run.inputs), nowIso())
     return this.database.getRun(runId)
   }

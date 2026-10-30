@@ -56,6 +56,8 @@ export function fanoutInnerSteps(stepId: string, steps: StepDefinition[]): StepD
   const owned = new Set(dependents.map((step) => step.id))
   const chains = sideChains(steps)
   const sideIds = new Set(chains.flatMap((chain) => chain.stepIds))
+  const ownChain = chains.find((chain) => chain.stepIds.includes(stepId))
+  const ownChainIds = new Set(ownChain?.stepIds ?? [])
   const ordered = [...steps].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name))
   const keptOut = new Set<string>()
   let after = false
@@ -65,6 +67,10 @@ export function fanoutInnerSteps(stepId: string, steps: StepDefinition[]): StepD
       continue
     }
     if (!after || upstream.has(step.id) || owned.has(step.id) || sideIds.has(step.id)) continue
+    if (ownChain && !ownChainIds.has(step.id)) {
+      keptOut.add(step.id)
+      continue
+    }
     if (step.type === 'merge' && step.config.mode === 'collect') {
       const targetId = step.config.fromFanoutStepId
       if (targetId === stepId || upstream.has(targetId)) break
@@ -83,8 +89,15 @@ export function fanoutInnerSteps(stepId: string, steps: StepDefinition[]): StepD
   return steps.filter((step) => owned.has(step.id))
 }
 
+/** Шаг ветвления и то, что выполняется внутри его элемента. */
+export function branchStepIds(sourceStepId: string, steps: StepDefinition[]): Set<string> {
+  return new Set([sourceStepId, ...fanoutInnerSteps(sourceStepId, steps).map((step) => step.id)])
+}
+
 function placedInAncestorFanout(depId: string, fanoutId: string, steps: StepDefinition[]): boolean {
   const ancestors = ancestorIds(fanoutId, steps)
+  const dependency = steps.find((step) => step.id === depId)
+  if (dependency?.iterate && ancestors.has(depId)) return true
   for (const fanout of steps) {
     if (!fanout.iterate || fanout.id === fanoutId || !ancestors.has(fanout.id)) continue
     if (innerDependents(fanout.id, steps).some((inner) => inner.id === depId)) return true
@@ -140,6 +153,8 @@ export function chainStepIds(stepId: string, steps: StepDefinition[]): Set<strin
   const origin = steps.find((step) => step.id === stepId)
   const out = new Set<string>()
   if (!origin) return out
+  const side = sideChains(steps).find((chain) => chain.stepIds.includes(stepId))
+  if (side) return idsWithin(stepId, steps, new Set(side.stepIds))
   const byId = new Map(steps.map((step) => [step.id, step]))
   const children = childMap(steps)
   const upstream = ancestorIds(stepId, steps)
@@ -182,6 +197,26 @@ export function chainStepIds(stepId: string, steps: StepDefinition[]): Set<strin
       if (hidden.has(step.id) || step.order <= owner.order || upstream.has(step.id)) continue
       add(step.id)
     }
+  }
+  return out
+}
+
+/** Хвост цепочки, который не выходит за переданный набор шагов. */
+function idsWithin(stepId: string, steps: StepDefinition[], allowed: Set<string>): Set<string> {
+  const byId = new Map(steps.map((step) => [step.id, step]))
+  const children = childMap(steps)
+  const upstream = ancestorIds(stepId, steps)
+  const out = new Set<string>()
+  const stack = [stepId]
+  while (stack.length) {
+    const current = stack.pop()
+    if (!current || out.has(current) || upstream.has(current) || !allowed.has(current)) continue
+    out.add(current)
+    const step = byId.get(current)
+    if (step?.iterate) {
+      for (const inner of fanoutInnerSteps(step.id, steps)) stack.push(inner.id)
+    }
+    for (const child of children.get(current) ?? []) stack.push(child.id)
   }
   return out
 }

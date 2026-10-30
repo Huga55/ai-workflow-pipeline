@@ -1,7 +1,7 @@
 import { extractJson, repairJson, validateJsonSchema } from '@core/json'
 import { inferKind } from '@core/labels'
 import { branchLabel } from '@core/labels'
-import { chainStepIds, fanoutInnerSteps, hiddenDescendantIds, isCollectMerge, owningFanoutId, topoSort } from '@core/graph'
+import { branchStepIds, chainStepIds, fanoutInnerSteps, hiddenDescendantIds, isCollectMerge, owningFanoutId, topoSort } from '@core/graph'
 import { sideChains } from '@core/side-branch'
 import { effectiveStep } from '@core/step-ref'
 import { createId, nowIso } from '@core/ids'
@@ -75,6 +75,7 @@ export class WorkflowEngine {
   async advance(options: AdvanceOptions): Promise<AdvanceResult> {
     this.sweepInterrupted(options.runId)
     this.retireMisplacedSideWaits(options)
+    this.retireForeignWaits(options)
     const single = options.retry ?? (options.focus?.mode === 'only' ? options.focus : null)
     if (single) return this.runSingle(options, single.stepId, single.branchId)
     if (options.focus?.mode === 'chain') {
@@ -126,7 +127,7 @@ export class WorkflowEngine {
         this.markSkipped(options, stepId, execution.branchId, applied.output)
       }
     }
-    this.refreshBranchStatus(options.runId, execution.branchId)
+    this.refreshBranchStatus(options.runId, execution.branchId, options.graph.steps)
     options.onProgress?.()
     if (applied.stopBranch) {
       this.setBranchStatus(options.runId, execution.branchId, 'cancelled')
@@ -135,7 +136,8 @@ export class WorkflowEngine {
     return this.advance({
       ...options,
       retry: undefined,
-      onlyBranchId: execution.branchId || undefined
+      onlyBranchId: execution.branchId || undefined,
+      ...sideContinuation(execution.stepId, options.graph.steps)
     })
   }
 
@@ -151,7 +153,8 @@ export class WorkflowEngine {
       ...options,
       retry: undefined,
       focus: undefined,
-      onlyBranchId: branchId || undefined
+      onlyBranchId: branchId || undefined,
+      ...sideContinuation(stepId, options.graph.steps)
     })
   }
 
@@ -311,17 +314,22 @@ export class WorkflowEngine {
     const sorted = topoSort(local)
     if (!sorted.ok) return this.failScope(scope, options, sorted.message)
 
-    const sideIds = sideIdsInScope(steps, local)
-    let sideResult: AdvanceResult = 'completed'
+    const sideChainsHere = sideChainsInScope(steps, local)
+    const sideOf = new Map<string, string>()
+    for (const chain of sideChainsHere) {
+      for (const id of chain.stepIds) sideOf.set(id, chain.rootId)
+    }
+    const sideResults = new Map<string, AdvanceResult>()
     let mainResult: AdvanceResult = 'completed'
     for (const step of sorted.steps) {
       if (options.signal?.aborted) return 'paused'
-      const onSide = sideIds.has(step.id)
-      if (onSide ? sideResult !== 'completed' : mainResult !== 'completed') continue
+      const sideRoot = sideOf.get(step.id) ?? null
+      const gate = sideRoot ? (sideResults.get(sideRoot) ?? 'completed') : mainResult
+      if (gate !== 'completed') continue
       if (options.allowStepIds && !this.stepAllowed(step, steps, options.allowStepIds)) continue
       const remember = (result: AdvanceResult) => {
         if (result === 'completed') return
-        if (onSide) sideResult = result
+        if (sideRoot) sideResults.set(sideRoot, result)
         else mainResult = result
       }
       if (step.iterate && step.id !== scope.entryStepId) {
@@ -366,7 +374,9 @@ export class WorkflowEngine {
       }
       if (options.untilStepId === step.id || step.stopAfter) remember('paused')
     }
-    return mergeAdvance(sideResult, mainResult)
+    let result = mainResult
+    for (const side of sideResults.values()) result = mergeAdvance(result, side)
+    return result
   }
 
   private async runFanout(
@@ -454,7 +464,7 @@ export class WorkflowEngine {
       if (!selected && !sequenceTail) continue
       if (step.iterate.launch === 'manual' && fresh.status === 'pending') {
         const exact = options.onlyBranchId === fresh.id
-        if (!exact && !options.startManualBranches) continue
+        if (!exact && !options.startManualBranches && !sideChainLaunchesElements(step.id, allSteps, options.allowStepIds)) continue
       }
       if (options.onlyBranchId === fresh.id && options.branchNote !== undefined) fresh.note = options.branchNote
       const child = this.childScope(scope, fresh, step.id)
@@ -481,7 +491,7 @@ export class WorkflowEngine {
       if (result === 'completed') this.setBranchStatus(options.runId, job.fresh.id, 'completed')
       else if (result === 'failed') this.setBranchStatus(options.runId, job.fresh.id, 'failed')
       else if (result === 'cancelled') this.setBranchStatus(options.runId, job.fresh.id, 'cancelled')
-      else this.refreshBranchStatus(options.runId, job.fresh.id)
+      else this.refreshBranchStatus(options.runId, job.fresh.id, allSteps)
       return result
     }
     if (step.iterate.launch === 'all') {
@@ -857,11 +867,12 @@ export class WorkflowEngine {
     this.store.updateBranch(branch)
   }
 
-  private refreshBranchStatus(runId: string, branchId: string): void {
+  private refreshBranchStatus(runId: string, branchId: string, steps: StepDefinition[]): void {
     if (!branchId) return
     const branch = this.store.listBranches(runId).find((item) => item.id === branchId)
     if (!branch) return
-    const executions = this.store.listExecutions(runId).filter((item) => item.branchId === branchId)
+    const allowed = branchStepIds(branch.sourceStepId, steps)
+    const executions = this.store.listExecutions(runId).filter((item) => item.branchId === branchId && allowed.has(item.stepId))
     const latest = new Map<string, StepExecution>()
     for (const execution of executions) {
       const prev = latest.get(execution.stepId)
@@ -872,7 +883,25 @@ export class WorkflowEngine {
     if (values.some((item) => item.status === 'waiting_for_user')) status = 'waiting_for_user'
     else if (values.some((item) => item.status === 'running')) status = 'running'
     else if (values.some((item) => item.status === 'failed')) status = 'failed'
+    else if (branch.status === 'waiting_for_user' || branch.status === 'running' || branch.status === 'failed') status = 'paused'
     this.setBranchStatus(runId, branchId, status)
+  }
+
+  private retireForeignWaits(options: AdvanceOptions): void {
+    const steps = options.graph.steps
+    const branches = new Map(this.store.listBranches(options.runId).map((branch) => [branch.id, branch]))
+    for (const execution of this.store.listExecutions(options.runId)) {
+      if (!execution.branchId) continue
+      if (execution.status !== 'waiting_for_user' && execution.status !== 'pending') continue
+      const branch = branches.get(execution.branchId)
+      if (!branch) continue
+      if (branchStepIds(branch.sourceStepId, steps).has(execution.stepId)) continue
+      execution.status = 'skipped'
+      execution.error = null
+      execution.finishedAt = nowIso()
+      this.store.updateExecution(execution)
+      this.refreshBranchStatus(options.runId, execution.branchId, steps)
+    }
   }
 
   private retireMisplacedSideWaits(options: AdvanceOptions): void {
@@ -890,7 +919,7 @@ export class WorkflowEngine {
       execution.error = null
       execution.finishedAt = nowIso()
       this.store.updateExecution(execution)
-      this.refreshBranchStatus(options.runId, execution.branchId)
+      this.refreshBranchStatus(options.runId, execution.branchId, steps)
     }
   }
 
@@ -930,16 +959,26 @@ export class WorkflowEngine {
   }
 }
 
-function sideIdsInScope(steps: StepDefinition[], local: StepDefinition[]): Set<string> {
+function sideContinuation(stepId: string, steps: StepDefinition[]): { allowStepIds: Set<string> } | undefined {
+  if (!sideChains(steps).some((chain) => chain.stepIds.includes(stepId))) return undefined
+  return { allowStepIds: chainStepIds(stepId, steps) }
+}
+
+/** Продолжение идёт только по доп. ветке: её ручной fanout запускает элементы, основная колонка в набор не входит. */
+function sideChainLaunchesElements(stepId: string, steps: StepDefinition[], allow: Set<string> | undefined): boolean {
+  if (!allow?.has(stepId)) return false
+  return sideChains(steps).some((chain) => {
+    const ids = new Set(chain.stepIds)
+    if (!ids.has(stepId)) return false
+    return [...allow].every((id) => ids.has(id))
+  })
+}
+
+function sideChainsInScope(steps: StepDefinition[], local: StepDefinition[]): ReturnType<typeof sideChains> {
   const localIds = new Set(local.map((step) => step.id))
-  const ids = new Set<string>()
-  for (const chain of sideChains(steps)) {
-    if (!localIds.has(chain.rootId)) continue
-    for (const id of chain.stepIds) {
-      if (localIds.has(id)) ids.add(id)
-    }
-  }
-  return ids
+  return sideChains(steps)
+    .filter((chain) => localIds.has(chain.rootId))
+    .map((chain) => ({ ...chain, stepIds: chain.stepIds.filter((id) => localIds.has(id)) }))
 }
 
 function manualAnswerValue(step: StepDefinition, text: string): unknown {

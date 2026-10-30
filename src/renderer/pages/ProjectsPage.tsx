@@ -1,8 +1,11 @@
 import { useEffect, useState } from 'react'
 import type { Project } from '@core/types'
+import { navHandlers, useOpenTab, useTabTitle } from '../tabs'
 import { errorText, whenText } from '../ui'
 
 export function ProjectsPage({ onOpen }: { onOpen: (projectId: string) => void }) {
+  const openTab = useOpenTab()
+  useTabTitle('Проекты')
   const [projects, setProjects] = useState<Project[]>([])
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
@@ -56,7 +59,15 @@ export function ProjectsPage({ onOpen }: { onOpen: (projectId: string) => void }
       </form>
       <div className="grid">
         {projects.map((project) => (
-          <button key={project.id} className="card" type="button" onClick={() => onOpen(project.id)}>
+          <button
+            key={project.id}
+            className="card"
+            type="button"
+            {...navHandlers(
+              () => onOpen(project.id),
+              () => openTab({ name: 'project', projectId: project.id })
+            )}
+          >
             <strong>{project.name}</strong>
             <span className="meta">{project.description || 'Без описания'}</span>
             <span className="meta">{whenText(project.updatedAt)}</span>
