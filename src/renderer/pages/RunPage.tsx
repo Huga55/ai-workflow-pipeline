@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
+import { chatIdFromUrl } from '@core/chat-url'
 import { chainStepIds } from '@core/graph'
 import { branchViewStatus, stepExecution } from '@core/run-layout'
 import { messagePreview, isSharedRef, resolveMessage } from '@core/shared-messages'
@@ -472,13 +473,6 @@ function storedValue(multiple: boolean, files: StoredFile[]): unknown {
   if (files.length === 0) return null
   if (files.length === 1) return files[0]
   return files
-}
-
-function chatIdFromUrl(url: string | null | undefined): string | null {
-  if (!url) return null
-  const match = url.match(/\/c\/([A-Za-z0-9-]{8,})\/?(?:[?#].*)?$/)
-  if (!match || match[1] === 'guest') return null
-  return match[1]
 }
 
 function ChatHashes({ chat }: { chat: RunDetails['chats'][number] | undefined }) {

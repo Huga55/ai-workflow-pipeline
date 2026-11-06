@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync } from 'node:fs'
 import { chromium, type BrowserContext, type Locator, type Page } from 'playwright-core'
+import { chatIdFromUrl } from '@core/chat-url'
 import { stitchChunks, stripCodeGutter } from '@core/json'
 import type { ContentPart } from '@core/types'
 
@@ -56,7 +57,8 @@ export class QwenBrowser {
         page = await this.readyPage(turn)
       }
       if (!page) throw closedChatError(turn.chatKey, this.loadUrl(turn.runId, turn.chatKey, turn.branchId))
-      const answer = await deliver(page, turn.parts, turn.signal)
+      const savedId = chatIdFromUrl(this.loadUrl(turn.runId, turn.chatKey, turn.branchId))
+      const answer = await deliver(page, turn.parts, turn.signal, savedId)
       this.remember(turn, page)
       return answer
     })
@@ -150,11 +152,7 @@ export class QwenBrowser {
       }
     }
     if (!pageOpen(page)) return null
-    if (saved && chatIdFromUrl(page.url()) !== savedId) {
-      await page.goto(saved, { waitUntil: 'domcontentloaded', timeout: 60_000 })
-      await dismissCookies(page)
-      await waitForComposer(page, turn.signal)
-    }
+    if (saved) await openSavedChat(page, saved, turn.signal)
     return page
   }
 
@@ -166,9 +164,7 @@ export class QwenBrowser {
     const page = await this.freshPage()
     this.slots.set(id, page)
     if (saved) {
-      await page.goto(saved, { waitUntil: 'domcontentloaded', timeout: 60_000 })
-      await dismissCookies(page)
-      await waitForComposer(page, turn.signal)
+      await openSavedChat(page, saved, turn.signal)
       return null
     }
     await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 })
@@ -182,7 +178,10 @@ export class QwenBrowser {
 
   private remember(turn: QwenTurn, page: Page): void {
     const url = durableChatUrl(page.url())
-    if (url) this.saveUrl(turn.runId, turn.chatKey, turn.branchId, url)
+    if (!url) return
+    const savedId = chatIdFromUrl(this.loadUrl(turn.runId, turn.chatKey, turn.branchId))
+    if (savedId && chatIdFromUrl(url) !== savedId) return
+    this.saveUrl(turn.runId, turn.chatKey, turn.branchId, url)
   }
 
   private async freshPage(): Promise<Page> {
@@ -342,13 +341,6 @@ function durableChatUrl(url: string | null): string | null {
   return url
 }
 
-function chatIdFromUrl(url: string | null): string | null {
-  if (!url) return null
-  const match = url.match(/\/c\/([A-Za-z0-9-]{8,})\/?(?:[?#].*)?$/)
-  if (!match || match[1] === 'guest') return null
-  return match[1]
-}
-
 function closedChatError(chatKey: string, url: string | null): Error {
   const hash = chatIdFromUrl(url)
   if (hash) return new Error(`Чат «${chatKey}» не открыт. Сохранённый хэш: ${hash}.`)
@@ -359,8 +351,73 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new Error('Остановлено')
 }
 
-async function deliver(page: Page, parts: ContentPart[], signal?: AbortSignal): Promise<string> {
+/** Страница уже удержала этот чат и больше не уходит на /c/new-chat. */
+const settledChat = new WeakMap<Page, string>()
+/** После холодного открытия /c/{id} Qwen сам уходит на главную и /c/new-chat. Ждём этот уход, затем открываем сохранённый адрес ещё раз. */
+const SAVED_CHAT_HOLD_MS = 3000
+const SAVED_CHAT_QUIET_MS = 4000
+
+async function openSavedChat(page: Page, saved: string, signal?: AbortSignal): Promise<void> {
+  const savedId = chatIdFromUrl(saved)
+  if (!savedId) return
+  if (settledChat.get(page) === savedId && chatIdFromUrl(page.url()) === savedId) {
+    await waitForComposer(page, signal)
+    if (chatIdFromUrl(page.url()) === savedId) return
+    settledChat.delete(page)
+  }
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    throwIfAborted(signal)
+    if (chatIdFromUrl(page.url()) !== savedId) {
+      await page.goto(saved, { waitUntil: 'domcontentloaded', timeout: 60_000 })
+    }
+    if (!(await urlHeld(page, savedId, SAVED_CHAT_HOLD_MS, signal))) {
+      await urlQuiet(page, SAVED_CHAT_QUIET_MS, signal)
+      continue
+    }
+    await dismissCookies(page)
+    await waitForComposer(page, signal)
+    if (chatIdFromUrl(page.url()) !== savedId) continue
+    settledChat.set(page, savedId)
+    return
+  }
+  settledChat.delete(page)
+  throw new Error(`Страница ушла с сохранённого чата на ${page.url() || 'другой адрес'}. Сообщение не отправлено, адрес чата в запуске сохранён.`)
+}
+
+async function urlHeld(page: Page, savedId: string, ms: number, signal?: AbortSignal): Promise<boolean> {
+  const deadline = Date.now() + ms
+  while (Date.now() < deadline) {
+    throwIfAborted(signal)
+    if (chatIdFromUrl(page.url()) !== savedId) return false
+    await page.waitForTimeout(200)
+  }
+  return chatIdFromUrl(page.url()) === savedId
+}
+
+async function urlQuiet(page: Page, ms: number, signal?: AbortSignal): Promise<void> {
+  let last = page.url()
+  let stableSince = Date.now()
+  const deadline = Date.now() + 15_000
+  while (Date.now() < deadline) {
+    throwIfAborted(signal)
+    const current = page.url()
+    if (current !== last) {
+      last = current
+      stableSince = Date.now()
+    } else if (Date.now() - stableSince >= ms) return
+    await page.waitForTimeout(200)
+  }
+}
+
+function sameChat(page: Page, expectedId?: string | null): void {
+  if (!expectedId) return
+  if (chatIdFromUrl(page.url()) === expectedId) return
+  throw new Error(`Страница ушла с сохранённого чата на ${page.url() || 'другой адрес'}. Сообщение не отправлено, адрес чата в запуске сохранён.`)
+}
+
+async function deliver(page: Page, parts: ContentPart[], signal?: AbortSignal, expectedId?: string | null): Promise<string> {
   throwIfAborted(signal)
+  sameChat(page, expectedId)
   await page.bringToFront().catch(() => undefined)
   const images = parts.filter((part) => part.type === 'image').map((part) => part.path)
   const text = parts
@@ -369,14 +426,14 @@ async function deliver(page: Page, parts: ContentPart[], signal?: AbortSignal): 
     .join('')
     .trim()
   const batches = imageBatches(images, IMAGES_PER_TURN)
-  if (batches.length <= 1) return deliverTurn(page, images, text, signal)
+  if (batches.length <= 1) return deliverTurn(page, images, text, signal, expectedId)
   let answer = ''
   for (let index = 0; index < batches.length; index += 1) {
     const last = index === batches.length - 1
     const note = last
       ? text
       : 'Это часть фотографий одного сообщения, следующие придут отдельно. Пока не анализируй и не выполняй задачу. Ответь только «Принято».'
-    answer = await deliverTurn(page, batches[index] ?? [], note, signal)
+    answer = await deliverTurn(page, batches[index] ?? [], note, signal, expectedId)
   }
   return answer
 }
@@ -388,17 +445,21 @@ function imageBatches(paths: string[], size: number): string[][] {
   return batches
 }
 
-async function deliverTurn(page: Page, images: string[], text: string, signal?: AbortSignal): Promise<string> {
+async function deliverTurn(page: Page, images: string[], text: string, signal?: AbortSignal, expectedId?: string | null): Promise<string> {
   throwIfAborted(signal)
+  sameChat(page, expectedId)
   const before = await answerCount(page)
   await dismissCookies(page)
   await confirmAge(page)
   if (images.length) await attachImages(page, images, signal)
+  sameChat(page, expectedId)
   if (text) {
     const composer = await waitForComposer(page, signal)
     await typePrompt(composer, text)
   }
+  sameChat(page, expectedId)
   const seen = await chatMark(page)
+  sameChat(page, expectedId)
   await submitComposer(page, Boolean(text || images.length), signal)
   return waitForAnswer(page, before, seen, signal)
 }
